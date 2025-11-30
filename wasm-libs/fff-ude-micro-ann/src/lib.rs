@@ -58,6 +58,9 @@ pub extern "C" fn search_ffi(
     out_ids_ptr: *mut u8,
     out_dists_ptr: *mut u8,
 ) -> i32 {
+    unsafe {
+        HEAP_OFFSET = 0;
+    }
     let dim = dim as usize;
     let k_out = k_out as usize;
     let query = unsafe { slice::from_raw_parts(query_ptr as *const f32, dim) };
@@ -107,3 +110,41 @@ pub extern "C" fn search_ffi(
     }
     k_out as i32
 }
+
+// Minimal bump allocator to satisfy host runtime expectations.
+static mut HEAP: [u8; 64 << 20] = [0; 64 << 20];
+static mut HEAP_OFFSET: usize = 0;
+
+#[no_mangle]
+pub extern "C" fn alloc(len: u32, _align: u32) -> u32 {
+    unsafe {
+        let mut start = (HEAP_OFFSET + 7) & !7;
+        if start == 0 {
+            start = 8;
+        }
+        let mut end = start + len as usize;
+        if end > HEAP.len() {
+            start = 8;
+            end = start + len as usize;
+            if end > HEAP.len() {
+                return 0;
+            }
+        }
+        HEAP_OFFSET = end;
+        start as u32
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn dealloc(_ptr: u32, _len: u32, _align: u32) {
+    // no-op for bump allocator
+}
+
+#[no_mangle]
+pub extern "C" fn buffer_iterator_next(_iter: *mut u8, _out: *mut u8, _out_buf: *mut u32) {}
+
+#[no_mangle]
+pub extern "C" fn buffer_iterator_drop(_iter: *mut u8) {}
+
+#[no_mangle]
+pub extern "C" fn buffer_drop(_buf: *mut u8) {}

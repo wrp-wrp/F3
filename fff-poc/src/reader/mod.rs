@@ -197,41 +197,32 @@ impl<R: Reader + Clone> FileReaderV2<R> {
                 continue;
             };
             let vector_meta = VectorColumn::from_fb(vector_meta_fb);
-            // Decode full column once per row group for slicing.
-            let mut col_idx_seq = ColumnIndexSequence::default();
-            let mut decoder_opt = None;
-            for (i, field) in footer.schema().fields().iter().enumerate() {
-                if i == column_idx {
-                    decoder_opt = Some(create_logical_decoder(
-                        &self.reader,
-                        Arc::clone(field),
-                        &rg_meta.column_metadatas,
-                        &mut col_idx_seq,
-                        self.wasm_context.as_ref().map(Arc::clone),
-                        self.shared_dictionary_cache.as_ref().unwrap(),
-                        self.checksum_type,
-                    )?);
-                    break;
-                }
-                advance_column_index(field.clone(), &mut col_idx_seq)?;
-            }
-            let mut decoder = decoder_opt
-                .ok_or_else(|| Error::General("failed to build decoder".to_string()))?;
-            let arrays = decoder.decode_batch()?;
-            let concatenated = concat(
-                arrays
-                    .iter()
-                    .map(|a| a.as_ref())
-                    .collect::<Vec<_>>()
-                    .as_slice(),
-            )?;
             for block in vector_meta.blocks {
                 // Fallback to full block if micro-index missing.
                 if block.micro_index.aux_size == 0 || block.micro_index.wasm_size == 0 {
-                    results.push(concatenated.slice(
+                    let mut col_idx_seq = ColumnIndexSequence::default();
+                    let mut decoder_opt = None;
+                    for (i, field) in footer.schema().fields().iter().enumerate() {
+                        if i == column_idx {
+                            decoder_opt = Some(create_logical_decoder(
+                                &self.reader,
+                                Arc::clone(field),
+                                &rg_meta.column_metadatas,
+                                &mut col_idx_seq,
+                                self.wasm_context.as_ref().map(Arc::clone),
+                                self.shared_dictionary_cache.as_ref().unwrap(),
+                                self.checksum_type,
+                            )?);
+                            break;
+                        }
+                        advance_column_index(field.clone(), &mut col_idx_seq)?;
+                    }
+                    let mut decoder = decoder_opt
+                        .ok_or_else(|| Error::General("failed to build decoder".to_string()))?;
+                    results.extend(decoder.decode_row_at(
                         block.row_start as usize,
                         block.row_count as usize,
-                    ));
+                    )?);
                     continue;
                 }
                 let mut aux_buf = vec![0u8; block.micro_index.aux_size as usize];
@@ -283,20 +274,46 @@ impl<R: Reader + Clone> FileReaderV2<R> {
                     .map_err(|e| Error::General(e.to_string()))?;
                 let best = u32::from_le_bytes(out_ids[0..4].try_into().unwrap()) as usize;
                 let spans = blob.bucket_spans.get(best).cloned().unwrap_or_default();
-                let mut slices = vec![];
-                for (start, len) in spans {
-                    let global_start = block.row_start as usize + start as usize;
-                    let len = len as usize;
-                    slices.push(concatenated.slice(global_start, len));
+                if spans.is_empty() {
+                    results.push(concat(&[])?);
+                    continue;
                 }
-                if slices.is_empty() {
-                    // Nothing selected; return empty slice for this block.
-                    results.push(concatenated.slice(block.row_start as usize, 0));
-                } else if slices.len() == 1 {
-                    results.push(slices.remove(0));
+                let mut per_block_arrays: Vec<ArrayRef> = vec![];
+                for (start, len) in spans {
+                    let mut col_idx_seq = ColumnIndexSequence::default();
+                    let mut decoder_opt = None;
+                    for (i, field) in footer.schema().fields().iter().enumerate() {
+                        if i == column_idx {
+                            decoder_opt = Some(create_logical_decoder(
+                                &self.reader,
+                                Arc::clone(field),
+                                &rg_meta.column_metadatas,
+                                &mut col_idx_seq,
+                                self.wasm_context.as_ref().map(Arc::clone),
+                                self.shared_dictionary_cache.as_ref().unwrap(),
+                                self.checksum_type,
+                            )?);
+                            break;
+                        }
+                        advance_column_index(field.clone(), &mut col_idx_seq)?;
+                    }
+                    let mut decoder = decoder_opt
+                        .ok_or_else(|| Error::General("failed to build decoder".to_string()))?;
+                    let mut decoded = decoder.decode_row_at(
+                        block.row_start as usize + start as usize,
+                        len as usize,
+                    )?;
+                    per_block_arrays.append(&mut decoded);
+                }
+                if per_block_arrays.len() == 1 {
+                    results.push(per_block_arrays.remove(0));
                 } else {
                     results.push(concat(
-                        slices.iter().map(|a| a.as_ref()).collect::<Vec<_>>().as_slice(),
+                        per_block_arrays
+                            .iter()
+                            .map(|a| a.as_ref())
+                            .collect::<Vec<_>>()
+                            .as_slice(),
                     )?);
                 }
             }

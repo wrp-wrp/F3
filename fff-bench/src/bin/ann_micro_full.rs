@@ -43,7 +43,7 @@ fn build_batch(rows: usize, dim: usize, rng: &mut StdRng) -> RecordBatch {
     let schema = Schema::new(vec![Field::new(
         "vector",
         DataType::FixedSizeList(
-            Arc::new(Field::new("item", DataType::Float32, false)),
+            Arc::new(Field::new("item", DataType::Float32, true)),
             dim as i32,
         ),
         false,

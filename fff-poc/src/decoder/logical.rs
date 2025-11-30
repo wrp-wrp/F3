@@ -5,7 +5,7 @@ use crate::dict::shared_dictionary_cache::SharedDictionaryCache;
 use crate::io::reader::Reader;
 use crate::{common::ColumnIndexSequence, context::WASMReadingContext};
 use arrow::array::AsArray;
-use arrow_array::{Array, ArrayRef, LargeListArray, ListArray, StructArray};
+use arrow_array::{Array, ArrayRef, FixedSizeListArray, LargeListArray, ListArray, StructArray};
 use arrow_buffer::{NullBuffer, OffsetBuffer, OffsetBufferBuilder, ScalarBuffer};
 use arrow_schema::{DataType, Field, FieldRef, Fields};
 use bytes::BytesMut;
@@ -178,11 +178,16 @@ impl<R: Reader> LogicalColDecoder for VectorColDecoder<'_, R> {
         inner
             .into_iter()
             .map(|arr| {
-                let bin = arr
+                if let Some(bin) = arr.as_any().downcast_ref::<arrow_array::BinaryArray>() {
+                    binary_to_vector(bin, self.dim, self.nullable)
+                } else if arr
                     .as_any()
-                    .downcast_ref::<arrow_array::BinaryArray>()
-                    .ok_or_else(|| general_error!("vector column expected binary payload"))?;
-                binary_to_vector(bin, self.dim, self.nullable)
+                    .is::<FixedSizeListArray>()
+                {
+                    Ok(arr)
+                } else {
+                    Ok(arr)
+                }
             })
             .collect()
     }
@@ -192,11 +197,16 @@ impl<R: Reader> LogicalColDecoder for VectorColDecoder<'_, R> {
         inner
             .into_iter()
             .map(|arr| {
-                let bin = arr
+                if let Some(bin) = arr.as_any().downcast_ref::<arrow_array::BinaryArray>() {
+                    binary_to_vector(bin, self.dim, self.nullable)
+                } else if arr
                     .as_any()
-                    .downcast_ref::<arrow_array::BinaryArray>()
-                    .ok_or_else(|| general_error!("vector column expected binary payload"))?;
-                binary_to_vector(bin, self.dim, self.nullable)
+                    .is::<FixedSizeListArray>()
+                {
+                    Ok(arr)
+                } else {
+                    Ok(arr)
+                }
             })
             .collect()
     }

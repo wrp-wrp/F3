@@ -37,6 +37,8 @@ pub struct FileWriterOptions {
     enable_io_unit_checksum: bool,
     /// The type of compression to use for EncUnits
     compression_type: CompressionType,
+    /// Enable vector micro-index writing (experimental).
+    enable_micro_index: bool,
 }
 
 impl Default for FileWriterOptions {
@@ -97,6 +99,10 @@ impl FileWriterOptions {
     pub fn compression_type(&self) -> CompressionType {
         self.compression_type
     }
+
+    pub fn enable_micro_index(&self) -> bool {
+        self.enable_micro_index
+    }
 }
 
 pub struct FileWriterOptionsBuilder {
@@ -125,6 +131,8 @@ pub struct FileWriterOptionsBuilder {
     enable_io_unit_checksum: bool,
     /// The type of compression to use for EncUnits
     compression_type: CompressionType,
+    /// Enable vector micro-index writing (experimental).
+    enable_micro_index: bool,
 }
 
 impl FileWriterOptionsBuilder {
@@ -141,6 +149,7 @@ impl FileWriterOptionsBuilder {
             dictionary_type: DictionaryTypeOptions::EncoderDictionary,
             enable_io_unit_checksum: false,
             compression_type: CompressionType::Uncompressed,
+            enable_micro_index: false,
         }
     }
 
@@ -159,6 +168,7 @@ impl FileWriterOptionsBuilder {
             dictionary_type: self.dictionary_type,
             enable_io_unit_checksum: self.enable_io_unit_checksum,
             compression_type: self.compression_type,
+            enable_micro_index: self.enable_micro_index,
         }
     }
 
@@ -212,6 +222,11 @@ impl FileWriterOptionsBuilder {
 
     pub fn set_compression_type(mut self, compression_type: CompressionType) -> Self {
         self.compression_type = compression_type;
+        self
+    }
+
+    pub fn enable_micro_index(mut self, enable: bool) -> Self {
+        self.enable_micro_index = enable;
         self
     }
 }

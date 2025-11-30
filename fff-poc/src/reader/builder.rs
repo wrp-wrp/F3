@@ -28,6 +28,8 @@ pub struct FileReaderV2Builder<R: Reader + Clone> {
     verify_io_unit_checksum: bool,
     /// Whether we verify the file checksum.
     verify_file_checksum: bool,
+    /// Whether to honor vector micro-index metadata (requires feature).
+    enable_micro_index: bool,
 }
 
 impl<R: Reader + Clone> FileReaderV2Builder<R> {
@@ -40,6 +42,7 @@ impl<R: Reader + Clone> FileReaderV2Builder<R> {
             wasm_rts: None,
             verify_io_unit_checksum: false,
             verify_file_checksum: false,
+            enable_micro_index: false,
         }
     }
 
@@ -79,6 +82,11 @@ impl<R: Reader + Clone> FileReaderV2Builder<R> {
     /// Whether we verify the file checksum.
     pub fn with_verify_file_checksum(mut self, verify_file_checksum: bool) -> Self {
         self.verify_file_checksum = verify_file_checksum;
+        self
+    }
+
+    pub fn with_enable_micro_index(mut self, enable_micro_index: bool) -> Self {
+        self.enable_micro_index = enable_micro_index;
         self
     }
 
@@ -296,6 +304,7 @@ impl<R: Reader + Clone> FileReaderV2Builder<R> {
             checksum_type: self
                 .verify_io_unit_checksum
                 .then_some(post_script.checksum_type),
+            enable_micro_index: self.enable_micro_index,
         })
     }
 }

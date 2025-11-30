@@ -104,6 +104,9 @@ pub struct Instance {
     decode: Option<TypedFunc<(u32, u32), i32>>,
     // extern "C" fn(ptr: *const u8, len: usize, out: *mut CSlice) -> i32
     functions: HashMap<String, TypedFunc<(u32, u32, u32), i32>>,
+    // Optional micro-ann helpers
+    micro_set_shape: Option<TypedFunc<(u32, u32), ()>>,
+    micro_search: Option<TypedFunc<(u32, u32, u32, u32, u32), i32>>,
     // Input pointer which can be reused during the lifetime of this instance
     cached_alloc_ptr: Option<u32>,
     // Input pointer len which can be reused during the lifetime of this instance
@@ -406,6 +409,84 @@ impl Runtime {
         Instance::new(self)
     }
 
+    /// Load a micro-ann instance (using functions `set_shape` + `search_ffi`).
+    pub fn call_micro_search(
+        &self,
+        dims: u32,
+        k_out: u32,
+        centroids: &[u8],
+        query: &[u8],
+        out_ids: &mut [u8],
+        out_dists: &mut [u8],
+    ) -> Result<i32> {
+        let instance = if let Some(inst) = self.instances.lock().unwrap().pop_front() {
+            inst
+        } else {
+            Arc::new(Mutex::new(Instance::new(self)?))
+        };
+        let mut guard = instance.lock().unwrap();
+        let mem = guard.memory;
+        let alloc_func = guard.alloc.clone();
+        let init_func = guard.init.clone();
+        let set_shape = guard.micro_set_shape.clone();
+        let search_func = guard.micro_search.clone();
+        let store = &mut guard.store;
+
+        let alloc_write = |data: &[u8],
+                           store: &mut Store<(WasiCtx, StoreLimits)>|
+         -> Result<u32> {
+            let len = u32::try_from(data.len()).context("input too large")?;
+            let ptr = alloc_func.call(&mut *store, (len, INPUT_ALIGNMENT))?;
+            ensure!(ptr != 0, "failed to allocate");
+            mem.write(store, ptr as usize, data)?;
+            Ok(ptr)
+        };
+
+        let centroid_ptr = alloc_write(centroids, store)?;
+        let query_ptr = alloc_write(query, store)?;
+        let out_ids_ptr = alloc_write(out_ids, store)?;
+        let out_dists_ptr = alloc_write(out_dists, store)?;
+
+        if let Some(init) = init_func {
+            let _ = init.call(
+                &mut *store,
+                (
+                    centroid_ptr,
+                    centroids.len() as u32,
+                    0,
+                    0,
+                    0,
+                ),
+            )?;
+        }
+        set_shape
+            .ok_or_else(|| anyhow!("set_shape not found in wasm"))?
+            .call(&mut *store, (dims, (centroids.len() as u32 / dims)))?;
+
+        let ret = search_func
+            .ok_or_else(|| anyhow!("search_ffi not found in wasm"))?
+            .call(
+                &mut *store,
+                (
+                    query_ptr,
+                    dims,
+                    k_out,
+                    out_ids_ptr,
+                    out_dists_ptr,
+                ),
+            )?;
+
+        let mut out_ids_host = vec![0u8; out_ids.len()];
+        mem.read(&mut *store, out_ids_ptr as usize, &mut out_ids_host)?;
+        out_ids.copy_from_slice(out_ids_host.as_slice());
+        let mut out_dists_host = vec![0u8; out_dists.len()];
+        mem.read(&mut *store, out_dists_ptr as usize, &mut out_dists_host)?;
+        out_dists.copy_from_slice(out_dists_host.as_slice());
+
+        self.instances.lock().unwrap().push_back(instance.clone());
+        Ok(ret)
+    }
+
     // WARNING: This function is for testing only.
     pub fn memory_size(&self) -> usize {
         let guard = self.instances.lock().unwrap();
@@ -521,6 +602,31 @@ impl WasmSlice {
 }
 
 impl Instance {
+    fn write_input(
+        &mut self,
+        input: &[u8],
+        store: &mut Store<(WasiCtx, StoreLimits)>,
+        align: u32,
+    ) -> Result<u32> {
+        let len = u32::try_from(input.len()).context("input too large")?;
+        let ptr = self.alloc.call(&mut *store, (len, align))?;
+        ensure!(ptr != 0, "failed to allocate");
+        self.memory.write(&mut *store, ptr as usize, input)?;
+        Ok(ptr)
+    }
+
+    fn read_output(
+        &mut self,
+        store: &mut Store<(WasiCtx, StoreLimits)>,
+        mem: Memory,
+        ptr: u32,
+        len: u32,
+    ) -> Result<Vec<u8>> {
+        let mut buf = vec![0u8; len as usize];
+        mem.read(&mut *store, ptr as usize, &mut buf)?;
+        Ok(buf)
+    }
+
     /// Create a new instance.
     pub fn new(rt: &Runtime) -> Result<Self> {
         let module = &rt.module;
@@ -575,6 +681,8 @@ impl Instance {
         let buffer_drop = instance.get_typed_func(&mut store, "buffer_drop")?;
         let init = instance.get_typed_func(&mut store, "init_ffi").ok();
         let decode = instance.get_typed_func(&mut store, "decode_ffi").ok();
+        let micro_set_shape = instance.get_typed_func(&mut store, "set_shape").ok();
+        let micro_search = instance.get_typed_func(&mut store, "search_ffi").ok();
         let memory = instance
             .get_memory(&mut store, "memory")
             .context("no memory")?;
@@ -587,6 +695,8 @@ impl Instance {
             buffer_drop,
             init,
             decode,
+            micro_set_shape,
+            micro_search,
             memory,
             store,
             functions,

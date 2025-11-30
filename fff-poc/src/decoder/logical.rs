@@ -18,6 +18,7 @@ use flatbuffers::{ForwardsUOffset, VectorIter};
 
 use super::physical::{create_physical_decoder, ChunkDecoder};
 use fff_core::non_nest_types;
+use crate::vector::{binary_to_vector, is_supported_vector};
 
 /// This maps to each logical column in the top level Arrow schema stored in file footer.
 pub trait LogicalColDecoder {
@@ -161,6 +162,43 @@ impl<R: Reader> LogicalColDecoder for PrimitiveColDecoder<'_, R> {
             remaining -= decoded;
         }
         Ok(arrays)
+    }
+}
+
+/// Decode FixedSizeList<Float32> vectors encoded via the binary path.
+pub struct VectorColDecoder<'a, R> {
+    inner: PrimitiveColDecoder<'a, R>,
+    dim: i32,
+    nullable: bool,
+}
+
+impl<R: Reader> LogicalColDecoder for VectorColDecoder<'_, R> {
+    fn decode_batch(&mut self) -> Result<Vec<ArrayRef>> {
+        let inner = self.inner.decode_batch()?;
+        inner
+            .into_iter()
+            .map(|arr| {
+                let bin = arr
+                    .as_any()
+                    .downcast_ref::<arrow_array::BinaryArray>()
+                    .ok_or_else(|| general_error!("vector column expected binary payload"))?;
+                binary_to_vector(bin, self.dim, self.nullable)
+            })
+            .collect()
+    }
+
+    fn decode_row_at(&mut self, row_id: usize, len: usize) -> Result<Vec<ArrayRef>> {
+        let inner = self.inner.decode_row_at(row_id, len)?;
+        inner
+            .into_iter()
+            .map(|arr| {
+                let bin = arr
+                    .as_any()
+                    .downcast_ref::<arrow_array::BinaryArray>()
+                    .ok_or_else(|| general_error!("vector column expected binary payload"))?;
+                binary_to_vector(bin, self.dim, self.nullable)
+            })
+            .collect()
     }
 }
 
@@ -610,6 +648,26 @@ pub fn create_logical_decoder<'a, R: Reader>(
         .ok_or_else(|| Error::General("No chunks in column meta".to_string()))?
         .iter();
     match field.data_type() {
+        dt if is_supported_vector(dt) => {
+            let dim = if let DataType::FixedSizeList(_, dim) = dt {
+                *dim
+            } else {
+                unreachable!()
+            };
+            Ok(Box::new(VectorColDecoder {
+                inner: PrimitiveColDecoder {
+                    r,
+                    chunk_decoder: None,
+                    chunks_meta_iter,
+                    primitive_type: DataType::Binary,
+                    wasm_context: wasm_context.map(|wasm_context| Arc::clone(&wasm_context)),
+                    shared_dictionary_cache,
+                    checksum_type,
+                },
+                dim,
+                nullable: field.is_nullable(),
+            }))
+        }
         non_nest_types!() => {
             let data_type = field.data_type().clone();
             Ok(Box::new(PrimitiveColDecoder {
@@ -680,6 +738,10 @@ pub fn create_logical_decoder<'a, R: Reader>(
 pub fn advance_column_index(field: FieldRef, column_idx: &mut ColumnIndexSequence) -> Result<()> {
     match field.data_type() {
         non_nest_types!() => {
+            let _column_index = column_idx.next_column_index();
+            Ok(())
+        }
+        dt if is_supported_vector(dt) => {
             let _column_index = column_idx.next_column_index();
             Ok(())
         }

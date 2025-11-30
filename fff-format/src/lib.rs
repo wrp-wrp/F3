@@ -1,6 +1,7 @@
 use flatbuffers::{FlatBufferBuilder, WIPOffset};
 
 pub mod File;
+pub mod vector;
 
 pub const MAJOR_VERSION: u16 = 0;
 pub const MINOR_VERSION: u16 = 1;

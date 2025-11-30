@@ -28,6 +28,7 @@ use crate::encoder::logical::{create_logical_encoder, LogicalTree};
 use crate::file::footer::create_default_encoding_versions;
 use crate::file::footer::{self, Chunk, ColumnMetadata, RowGroupMetadata, RowGroupsTable};
 use crate::options::FileWriterOptions;
+use std::path::Path;
 
 use fff_core::{errors::Result, nyi_err};
 
@@ -43,6 +44,10 @@ struct FileWriteState<W: Write + Seek> {
     column_metadatas_in_cur_row_group: Vec<ColumnMetadata>,
     start_offset_of_cur_row_group: u64,
     num_rows_in_cur_row_group: u32,
+    /// Track rows written per column for vector block row_start.
+    rows_written_in_cur_row_group: Vec<u64>,
+    /// Whether to emit vector micro-index metadata (experimental).
+    enable_micro_index: bool,
 }
 
 impl<W> FileWriteState<W>
@@ -50,8 +55,50 @@ where
     W: Write + Seek,
 {
     pub fn flush_chunk(&mut self, chunk: EncodedColumnChunk) -> Result<()> {
+        let micro_aux = chunk.micro_index_aux.clone();
         let column_index = chunk.column_index;
         let chunk_meta = self.flush_chunk_and_get_metadata(chunk)?;
+        let mut aux_meta = None;
+        if self.enable_micro_index {
+            if let Some(aux) = micro_aux {
+                let aux_offset = self.writer.stream_position()?;
+                self.write_and_update_file_level_checksum(&aux.bytes)?;
+                let aux_size = (self.writer.stream_position()? - aux_offset) as u32;
+                aux_meta = Some((aux_offset, aux_size, aux.reserved));
+            }
+        }
+        if self.enable_micro_index {
+            let row_start = self.rows_written_in_cur_row_group[column_index as usize];
+            let num_rows = chunk_meta.num_rows();
+            let offset = chunk_meta.offset();
+            let size = chunk_meta.size();
+            self.rows_written_in_cur_row_group[column_index as usize] += num_rows;
+            let mut vb = fff_format::vector::VectorBlock {
+                offset,
+                size,
+                row_start,
+                row_count: num_rows as u32,
+                align: 4096,
+                micro_index: fff_format::vector::MicroIndex {
+                    wasm_offset: 0,
+                    wasm_size: 0,
+                    abi_major: 0,
+                    abi_minor: 0,
+                    aux_offset: 0,
+                    aux_size: 0,
+                    reserved: aux_meta
+                        .as_ref()
+                        .map(|(_, _, r)| r.clone())
+                        .unwrap_or_default(),
+                },
+            };
+            if let Some((aux_offset, aux_size, _)) = aux_meta {
+                vb.micro_index.aux_offset = aux_offset;
+                vb.micro_index.aux_size = aux_size;
+            }
+            self.column_metadatas_in_cur_row_group[column_index as usize]
+                .add_vector_block(vb, 0);
+        }
         // use chunk.column_index to let the metadata knows which physical column does this chunk belong to
         self.column_metadatas_in_cur_row_group[column_index as usize].add_chunk(chunk_meta);
         Ok(())
@@ -112,6 +159,8 @@ where
         );
         self.num_rows_in_cur_row_group = 0;
         self.start_offset_of_cur_row_group = self.writer.stream_position()?;
+        // Reset per-column row counters for next row group.
+        self.rows_written_in_cur_row_group.fill(0);
         Ok(())
     }
 
@@ -214,6 +263,7 @@ impl<W: Write + Seek> FileWriter<W> {
                 wasm_context.clone(),
                 options.dictionary_type(),
                 options.compression_type(),
+                options.enable_micro_index(),
             )?;
             column_encoders.push(encoder);
             child_trees.push(child_tree);
@@ -237,6 +287,8 @@ impl<W: Write + Seek> FileWriter<W> {
                 data_checksum: create_checksum(&checksum_type),
                 column_counters: vec![EncodingCounter::default(); num_physical_columns],
                 enable_io_unit_checksum: options.enable_io_unit_checksum(),
+                rows_written_in_cur_row_group: vec![0; num_physical_columns],
+                enable_micro_index: options.enable_micro_index(),
             },
             schema_checksum: create_checksum(&checksum_type),
             wasm_context,
@@ -340,18 +392,40 @@ impl<W: Write + Seek> FileWriter<W> {
 
         let mut fbb = FlatBufferBuilder::new();
         // write WASM binaries.
-        let wasms: Vec<_> = self
+        // Prepare wasm binaries (append micro-ann wasm if enabled and available).
+        let mut wasm_bins: Vec<Vec<u8>> = self
             .wasm_context
             .get_sorted_wasms()
             .into_iter()
+            .map(|b| b.to_vec())
+            .collect();
+        let mut micro_wasm_index: Option<usize> = None;
+        if self.state.enable_micro_index {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../target/wasm32-wasip1/release/fff_ude_micro_ann.wasm");
+            if let Ok(bytes) = std::fs::read(&path) {
+                micro_wasm_index = Some(wasm_bins.len());
+                wasm_bins.push(bytes);
+            } else {
+                eprintln!(
+                    "micro-ann wasm not found at {}, skip micro index offsets",
+                    path.display()
+                );
+            }
+        }
+
+        let mut wasm_meta_offsets: Vec<(u64, u32)> = Vec::new();
+        let wasms: Vec<_> = wasm_bins
+            .into_iter()
             .map(|wasm| {
                 let offset = self.state.writer.stream_position()?;
-                self.state.write_and_update_file_level_checksum(wasm)?;
-                let size = self.state.writer.stream_position()? - offset;
+                self.state.write_and_update_file_level_checksum(&wasm)?;
+                let size = (self.state.writer.stream_position()? - offset) as u32;
                 let mut b = fb::MetadataSectionBuilder::new(&mut fbb);
                 b.add_offset(offset);
-                b.add_size_(size as u32);
+                b.add_size_(size);
                 b.add_compression_type(CompressionType::Uncompressed);
+                wasm_meta_offsets.push((offset, size));
                 Ok(b.finish())
             })
             .collect::<Result<Vec<flatbuffers::WIPOffset<fb::MetadataSection>>>>()?;
@@ -365,6 +439,14 @@ impl<W: Write + Seek> FileWriter<W> {
         let wasm_meta_start = self.state.writer.stream_position()?;
         self.state.write_and_update_file_level_checksum(wasms)?;
         let wasm_meta_size = self.state.writer.stream_position()? - wasm_meta_start;
+
+        if let Some(idx) = micro_wasm_index {
+            if let Some((off, size)) = wasm_meta_offsets.get(idx).copied() {
+                self.state
+                    .row_groups_table
+                    .apply_micro_index_offset(off, size, (0, 1));
+            }
+        }
 
         // write ColumnMetadata and update indirect_row_group_metadata
         let metadata_start = self

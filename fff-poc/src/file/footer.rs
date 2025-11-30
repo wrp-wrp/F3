@@ -13,6 +13,7 @@ use arrow_ipc::root_as_message;
 use arrow_schema::Schema;
 use arrow_schema::SchemaRef;
 use fff_format::File::fff::flatbuf as fb;
+use fff_format::vector::{VectorBlock, VectorColumn};
 
 use crate::common::checksum::Checksum;
 use crate::common::checksum::ChecksumType;
@@ -109,6 +110,7 @@ pub(crate) enum DictionaryEncoding {
 #[derive(Default, Clone)]
 pub struct ColumnMetadata {
     column_chunks: Vec<Chunk>,
+    vector_column: Option<VectorColumn>,
 }
 
 // impl From<&fb::ColumnMetadata<'_>> for ColumnMetadata {
@@ -128,25 +130,90 @@ impl ColumnMetadata {
     pub fn add_chunk(&mut self, chunk: Chunk) {
         self.column_chunks.push(chunk);
     }
+
+    pub fn add_vector_block(&mut self, block: VectorBlock, io_hint_bytes: u32) {
+        let vc = self
+            .vector_column
+            .get_or_insert(VectorColumn {
+                blocks: Vec::new(),
+                io_hint_bytes,
+            });
+        vc.blocks.push(block);
+    }
+
+    pub fn apply_micro_index_offset(&mut self, wasm_offset: u64, wasm_size: u32, abi: (u16, u16)) {
+        if let Some(vc) = &mut self.vector_column {
+            for b in &mut vc.blocks {
+                b.micro_index.wasm_offset = wasm_offset;
+                b.micro_index.wasm_size = wasm_size;
+                b.micro_index.abi_major = abi.0;
+                b.micro_index.abi_minor = abi.1;
+            }
+        }
+    }
 }
 
 impl ToFlatBuffer for ColumnMetadata {
     type Target<'a> = fb::ColumnMetadata<'a>;
 
     fn to_fb<'fb>(&self, fbb: &mut FlatBufferBuilder<'fb>) -> WIPOffset<Self::Target<'fb>> {
-        // All column chunks are written to the buffer in fbb
-        // Then the WIPOffsets (just uints) are collected and created as a Vector
-        // The copy cost is not significant
-        let chunks = &self
+        let chunk_offsets = self
             .column_chunks
             .iter()
             .map(|x| x.to_fb(fbb))
             .collect::<Vec<_>>();
-        let chunks = fbb.create_vector(chunks);
+        let chunks = fbb.create_vector(&chunk_offsets);
+
+        let vector_column_offset = self.vector_column.as_ref().map(|vc| {
+            let blocks = vc
+                .blocks
+                .iter()
+                .map(|b| {
+                    let reserved_vec = if b.micro_index.reserved.is_empty() {
+                        None
+                    } else {
+                        Some(fbb.create_vector(&b.micro_index.reserved))
+                    };
+                    let mi = fb::MicroIndex::create(
+                        fbb,
+                        &fb::MicroIndexArgs {
+                            wasm_offset: b.micro_index.wasm_offset,
+                            wasm_size: b.micro_index.wasm_size,
+                            abi_major: b.micro_index.abi_major,
+                            abi_minor: b.micro_index.abi_minor,
+                            aux_offset: b.micro_index.aux_offset,
+                            aux_size: b.micro_index.aux_size,
+                            reserved: reserved_vec,
+                        },
+                    );
+                    fb::VectorBlock::create(
+                        fbb,
+                        &fb::VectorBlockArgs {
+                            offset: b.offset,
+                            size_: b.size,
+                            row_start: b.row_start,
+                            row_count: b.row_count,
+                            align: b.align,
+                            micro_index: Some(mi),
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            let blocks_vec = fbb.create_vector(&blocks);
+            fb::VectorColumn::create(
+                fbb,
+                &fb::VectorColumnArgs {
+                    blocks: Some(blocks_vec),
+                    io_hint_bytes: vc.io_hint_bytes,
+                },
+            )
+        });
+
         fb::ColumnMetadata::create(
             fbb,
             &fb::ColumnMetadataArgs {
                 column_chunks: Some(chunks),
+                vector_column: vector_column_offset,
             },
         )
     }
@@ -224,6 +291,14 @@ impl Chunk {
 
     pub fn offset(&self) -> u64 {
         self.offset
+    }
+
+    pub fn size(&self) -> u32 {
+        self.size
+    }
+
+    pub fn num_rows(&self) -> u64 {
+        self.num_rows
     }
 }
 
@@ -522,6 +597,10 @@ impl RowGroupMetadata {
     pub fn col_metadatas(&self) -> &[ColumnMetadata] {
         &self.col_metadatas
     }
+
+    pub fn col_metadatas_mut(&mut self) -> &mut [ColumnMetadata] {
+        &mut self.col_metadatas
+    }
 }
 
 impl From<&fb::RowGroupMetadata<'_>> for IndirectRowGroupMetadata {
@@ -602,6 +681,14 @@ impl RowGroupsTable {
 
     pub fn indirect_row_group_metadata(&self) -> &[IndirectRowGroupMetadata] {
         &self.indirect_row_group_metadata
+    }
+
+    pub fn apply_micro_index_offset(&mut self, wasm_offset: u64, wasm_size: u32, abi: (u16, u16)) {
+        for rg in &mut self.row_group_metadata {
+            for cm in rg.col_metadatas_mut() {
+                cm.apply_micro_index_offset(wasm_offset, wasm_size, abi);
+            }
+        }
     }
 
     /// Write ColumnMetadata as FBS to file and update indirect_row_group_metadata

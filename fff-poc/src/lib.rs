@@ -9,6 +9,7 @@ pub mod io;
 pub mod options;
 pub mod reader;
 pub mod writer;
+pub mod vector;
 
 pub mod context;
 pub mod decoder;

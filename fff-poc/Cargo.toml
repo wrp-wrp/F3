@@ -73,3 +73,4 @@ wasm-test-encoders.workspace = true
 default = []
 # default = ["list-offsets-pushdown"]
 list-offsets-pushdown = []
+ann-wasm-micro = []

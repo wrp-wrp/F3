@@ -27,6 +27,7 @@ members = [
     "wasm-libs/fff-ude-example-zstd",
     "wasm-libs/fff-ude-example-flsbp",
     "wasm-libs/fff-ude-example-fff",
+    "wasm-libs/fff-ude-micro-ann",
     # "fff-ude-macros",
     "fff-ude-wasm",
     "wasm-libs/test-size",

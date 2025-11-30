@@ -9,6 +9,7 @@ use crate::{
     context::WASMWritingContext,
     counter::EncodingCounter,
     dict::{shared_dictionary_context::SharedDictionaryContext, DictionaryTypeOptions},
+    vector::{is_supported_vector, vector_to_binary, build_mini_ivf},
 };
 use arrow_array::cast::AsArray;
 use arrow_array::Array;
@@ -107,6 +108,99 @@ impl LogicalColEncoder for FlatColEncoder {
 
     fn submit_dict(&mut self, shared_dict_ctx: &mut SharedDictionaryContext) -> Result<()> {
         self.data_encoder.submit_dict(shared_dict_ctx)
+    }
+}
+
+/// Encode FixedSizeList<Float32> vectors via the binary path while attaching micro-index payloads.
+pub struct VectorColEncoder {
+    binary_encoder: Box<dyn PhysicalColEncoder>,
+    column_index: u32,
+    dim: i32,
+    enable_micro_index: bool,
+    /// Accumulated vectors (flattened) to align with chunk flushes.
+    pending_vectors: Vec<f32>,
+    pending_rows: usize,
+}
+
+impl LogicalColEncoder for VectorColEncoder {
+    fn encode(
+        &mut self,
+        array: ArrayRef,
+        counter: &mut EncodingCounter,
+        shared_dict_ctx: &mut SharedDictionaryContext,
+    ) -> Result<Option<Vec<EncodedColumnChunk>>> {
+        let vector_arr = array
+            .as_any()
+            .downcast_ref::<arrow_array::FixedSizeListArray>()
+            .expect("vector encoder expects FixedSizeList<Float32>");
+        let dim = self.dim as usize;
+        // record raw vectors for micro-indexing
+        if self.enable_micro_index {
+            let values = vector_arr
+                .values()
+                .as_primitive::<arrow_array::types::Float32Type>();
+            for i in 0..vector_arr.len() {
+                if vector_arr.is_null(i) {
+                    self.pending_vectors.extend(std::iter::repeat(0.0).take(dim));
+                } else {
+                    let start = vector_arr.value_offset(i) as usize;
+                    self.pending_vectors
+                        .extend_from_slice(&values.values()[start..start + dim]);
+                }
+            }
+            self.pending_rows += vector_arr.len();
+        }
+        let binary = vector_to_binary(vector_arr)?;
+        let mut res = vec![];
+        for mut chunk in self
+            .binary_encoder
+            .encode(Arc::new(binary), counter, shared_dict_ctx)?
+        {
+            if self.enable_micro_index {
+                let rows = chunk.num_rows;
+                let take_len = rows * dim;
+                let vectors = self.pending_vectors.drain(..take_len).collect::<Vec<_>>();
+                let blob = build_mini_ivf(dim, &vectors, rows);
+                chunk.micro_index_aux = Some(crate::encoder::encoded_column_chunk::MicroIndexAux {
+                    bytes: crate::vector::serialize_micro_blob(&blob),
+                    reserved: vec![blob.k, blob.dim],
+                });
+                self.pending_rows -= rows;
+            }
+            res.push(chunk.update_column_index(self.column_index));
+        }
+        Ok((!res.is_empty()).then_some(res))
+    }
+
+    fn memory_size(&self) -> usize {
+        self.binary_encoder.memory_size()
+    }
+
+    fn finish(
+        &mut self,
+        counter: &mut EncodingCounter,
+        shared_dict_ctx: &mut SharedDictionaryContext,
+    ) -> Result<Option<Vec<EncodedColumnChunk>>> {
+        let mut res = vec![];
+        for mut chunk in self.binary_encoder.finish(counter, shared_dict_ctx)? {
+            if self.enable_micro_index && chunk.num_rows > 0 {
+                let dim = self.dim as usize;
+                let take_len = chunk.num_rows * dim;
+                let vectors = self.pending_vectors.drain(..take_len).collect::<Vec<_>>();
+                let blob = build_mini_ivf(dim, &vectors, chunk.num_rows);
+                chunk.micro_index_aux = Some(crate::encoder::encoded_column_chunk::MicroIndexAux {
+                    bytes: crate::vector::serialize_micro_blob(&blob),
+                    reserved: vec![blob.k, blob.dim],
+                });
+                self.pending_rows = self.pending_rows.saturating_sub(chunk.num_rows);
+            }
+            res.push(chunk.update_column_index(self.column_index));
+        }
+        Ok((!res.is_empty()).then_some(res))
+    }
+
+    fn submit_dict(&mut self, shared_dict_ctx: &mut SharedDictionaryContext) -> Result<()> {
+        self.binary_encoder.submit_dict(shared_dict_ctx)
     }
 }
 
@@ -320,8 +414,34 @@ pub fn create_logical_encoder(
     wasm_context: Arc<WASMWritingContext>,
     dictionary_type: DictionaryTypeOptions,
     compression_type: fb::CompressionType,
+    enable_micro_index: bool,
 ) -> Result<(Box<dyn LogicalColEncoder>, LogicalTree)> {
     match field.data_type() {
+        dt if is_supported_vector(dt) => {
+            let dim = if let DataType::FixedSizeList(_, dim) = dt {
+                *dim
+            } else {
+                unreachable!()
+            };
+            Ok((
+                Box::new(VectorColEncoder {
+                    binary_encoder: create_physical_encoder(
+                        &DataType::Binary,
+                        max_chunk_size,
+                        field.is_nullable(),
+                        wasm_context,
+                        dictionary_type,
+                        compression_type,
+                    )?,
+                    column_index: column_idx.next_column_index(),
+                    dim,
+                    enable_micro_index,
+                    pending_vectors: Vec::new(),
+                    pending_rows: 0,
+                }),
+                LogicalTree::new(fb::LogicalId::FLAT, vec![]),
+            ))
+        }
         non_nest_types!() => Ok((
             Box::new(FlatColEncoder {
                 data_encoder: create_physical_encoder(
@@ -384,6 +504,7 @@ pub fn create_logical_encoder(
                         wasm_context,
                         dictionary_type,
                         compression_type,
+                        enable_micro_index,
                     )?;
                     Ok((
                         Box::new(ListColEncoder {
@@ -409,6 +530,7 @@ pub fn create_logical_encoder(
                     wasm_context.clone(),
                     dictionary_type,
                     compression_type,
+                    enable_micro_index,
                 )?;
                 fields_encoders.push(enc);
                 child_trees.push(child_tree);
@@ -527,6 +649,7 @@ mod tests {
             Arc::new(WASMWritingContext::empty()),
             DictionaryTypeOptions::EncoderDictionary,
             fb::CompressionType::Uncompressed,
+            false,
         )
         .unwrap()
         .0;

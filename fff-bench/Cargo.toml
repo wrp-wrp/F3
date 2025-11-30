@@ -23,7 +23,7 @@ wasi-common = { workspace = true }
 bytemuck = { workspace = true }
 # higher wasmer version causes conflicts on wat version with wasmtime
 wasmer = { version = "4.2.2" }
-fff-poc = { path = "../fff-poc" }
+fff-poc = { path = "../fff-poc", features = ["ann-wasm-micro"] }
 fff-core = { path = "../fff-core" }
 fff-format = { path = "../fff-format" }
 tempfile = { workspace = true }
@@ -64,6 +64,14 @@ simplelog = "0.12.2"
 
 arrow-json = { workspace = true }
 bytes = { workspace = true }
+wat = "1.0"
+rand_distr = "0.4"
+lance = { git = "https://github.com/lancedb/lance.git", rev = "v0.17.0" }
+arrow-schema = { workspace = true }
+arrow-array-52 = { package = "arrow-array", version = "52.2.0" }
+arrow-schema-52 = { package = "arrow-schema", version = "52.2.0" }
+lance-index = { git = "https://github.com/lancedb/lance.git", rev = "v0.17.0" }
+lance-linalg = { git = "https://github.com/lancedb/lance.git", rev = "v0.17.0" }
 
 fff-encoding = { path = "../fff-encoding" }
 fff-test-util = { path = "../fff-test-util" }
@@ -100,6 +108,14 @@ roaring = "*"
 
 [[bin]]
 name = "bench_wasm_decode"
+
+[[bin]]
+name = "ann_micro_filter"
+path = "src/bin/ann_micro_filter.rs"
+
+[[bin]]
+name = "ann_micro_filter_disk"
+path = "src/bin/ann_micro_filter_disk.rs"
 
 # [[bin]]
 # name = "footer"

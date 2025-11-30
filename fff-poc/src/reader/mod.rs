@@ -7,8 +7,12 @@ use crate::{
     file::footer::{Footer, GroupedColumnMetadata, PostScript},
     io::reader::Reader,
 };
+#[cfg(feature = "ann-wasm-micro")]
+use crate::decoder::logical::advance_column_index;
+#[cfg(feature = "ann-wasm-micro")]
+use crate::vector::{is_supported_vector, parse_micro_blob};
 use arrow::compute::concat;
-use arrow_array::RecordBatch;
+use arrow_array::{ArrayRef, RecordBatch};
 use arrow_buffer::MutableBuffer;
 use arrow_schema::{DataType, Field, FieldRef, Schema, SchemaRef};
 use byteorder::{ByteOrder, LittleEndian};
@@ -19,7 +23,13 @@ use fff_core::{
 };
 use fff_format::File::fff::flatbuf::{self as fb, CompressionType};
 use fff_format::{MAGIC, POSTSCRIPT_SIZE};
+#[cfg(feature = "ann-wasm-micro")]
+use fff_format::vector::VectorColumn;
+#[cfg(feature = "ann-wasm-micro")]
+use fff_ude_wasm::Runtime;
 use std::sync::Arc;
+#[cfg(feature = "ann-wasm-micro")]
+use std::collections::HashMap;
 
 mod projection;
 pub use projection::Projection;
@@ -95,15 +105,17 @@ pub struct FileReaderV2<R> {
     shared_dictionary_cache: Option<SharedDictionaryCache>,
     /// Whether we verify the IOUnit checksum.
     checksum_type: Option<ChecksumType>,
+    /// Enable vector micro-index usage (feature gated).
+    enable_micro_index: bool,
 }
 
-impl<R: Reader> FileReaderV2<R> {
+impl<R: Reader + Clone> FileReaderV2<R> {
     pub fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
 
-    pub fn read_file(&mut self) -> Result<Vec<RecordBatch>> {
-        let footer = Footer::try_new_with_projection(
+    fn materialize_footer(&self) -> Result<Footer> {
+        Footer::try_new_with_projection(
             &self.row_group_cnt_n_pointers,
             self.grouped_column_metadata_buffers
                 .iter()
@@ -115,9 +127,14 @@ impl<R: Reader> FileReaderV2<R> {
                 })
                 .collect(),
             self.schema.clone(),
-        )?;
+        )
+    }
+
+    pub fn read_file(&mut self) -> Result<Vec<RecordBatch>> {
+        let footer = self.materialize_footer()?;
+        let mut reader = self.reader.clone();
         read_file_based_on_footer(
-            &mut self.reader,
+            &mut reader,
             footer,
             &self.projections,
             &self.selection,
@@ -131,20 +148,160 @@ impl<R: Reader> FileReaderV2<R> {
     pub fn get_shared_dict_sizes(
         &mut self,
     ) -> Result<(Vec<EncodingCounter>, Vec<Vec<(usize, usize)>>)> {
-        let footer = Footer::try_new_with_projection(
-            &self.row_group_cnt_n_pointers,
-            self.grouped_column_metadata_buffers
-                .iter()
-                .map(|c_buffers| {
-                    c_buffers
-                        .iter()
-                        .map(|c_buffer| c_buffer.as_ref())
-                        .collect::<Vec<_>>()
-                })
-                .collect(),
-            self.schema.clone(),
-        )?;
+        let footer = self.materialize_footer()?;
         get_shared_dict_size_based_on_footer(footer, self.shared_dictionary_cache.as_ref().unwrap())
+    }
+
+    /// Run a micro-indexed vector search on a FixedSizeList<Float32> column.
+    #[cfg(feature = "ann-wasm-micro")]
+    pub fn search_vector_column(
+        &mut self,
+        column_idx: usize,
+        query: &[f32],
+        k_out: usize,
+    ) -> Result<Vec<ArrayRef>> {
+        if !self.enable_micro_index {
+            return Err(Error::General("micro index is disabled".into()));
+        }
+        let footer = self.materialize_footer()?;
+        if !is_supported_vector(footer.schema().field(column_idx).data_type()) {
+            return Err(Error::General("target column is not a supported vector type".into()));
+        }
+        let mut runtimes: HashMap<(u64, u32), Arc<Runtime>> = HashMap::new();
+        let selected_rg_metas = process_selection(&self.selection, footer.row_group_metadatas());
+        let mut results = vec![];
+        for (rg_meta, _) in selected_rg_metas {
+            let column_meta = rg_meta
+                .column_metadatas
+                .get(column_idx)
+                .ok_or_else(|| Error::General("column metadata missing".into()))?;
+            let Some(vector_meta_fb) = column_meta.vector_column() else {
+                // Fallback to full decode.
+                let mut col_idx_seq = ColumnIndexSequence::default();
+                for (i, field) in footer.schema().fields().iter().enumerate() {
+                    if i == column_idx {
+                        let mut decoder = create_logical_decoder(
+                            &self.reader,
+                            Arc::clone(field),
+                            &rg_meta.column_metadatas,
+                            &mut col_idx_seq,
+                            self.wasm_context.as_ref().map(Arc::clone),
+                            self.shared_dictionary_cache.as_ref().unwrap(),
+                            self.checksum_type,
+                        )?;
+                        results.extend(decoder.decode_batch()?);
+                        break;
+                    }
+                    advance_column_index(field.clone(), &mut col_idx_seq)?;
+                }
+                continue;
+            };
+            let vector_meta = VectorColumn::from_fb(vector_meta_fb);
+            // Decode full column once per row group for slicing.
+            let mut col_idx_seq = ColumnIndexSequence::default();
+            let mut decoder_opt = None;
+            for (i, field) in footer.schema().fields().iter().enumerate() {
+                if i == column_idx {
+                    decoder_opt = Some(create_logical_decoder(
+                        &self.reader,
+                        Arc::clone(field),
+                        &rg_meta.column_metadatas,
+                        &mut col_idx_seq,
+                        self.wasm_context.as_ref().map(Arc::clone),
+                        self.shared_dictionary_cache.as_ref().unwrap(),
+                        self.checksum_type,
+                    )?);
+                    break;
+                }
+                advance_column_index(field.clone(), &mut col_idx_seq)?;
+            }
+            let mut decoder = decoder_opt
+                .ok_or_else(|| Error::General("failed to build decoder".to_string()))?;
+            let arrays = decoder.decode_batch()?;
+            let concatenated = concat(
+                arrays
+                    .iter()
+                    .map(|a| a.as_ref())
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+            )?;
+            for block in vector_meta.blocks {
+                // Fallback to full block if micro-index missing.
+                if block.micro_index.aux_size == 0 || block.micro_index.wasm_size == 0 {
+                    results.push(concatenated.slice(
+                        block.row_start as usize,
+                        block.row_count as usize,
+                    ));
+                    continue;
+                }
+                let mut aux_buf = vec![0u8; block.micro_index.aux_size as usize];
+                self.reader
+                    .read_exact_at(&mut aux_buf, block.micro_index.aux_offset)?;
+                let blob = parse_micro_blob(&aux_buf)?;
+                if blob.dim as usize != query.len() {
+                    return Err(Error::General(
+                        "query dimension does not match micro-index".into(),
+                    ));
+                }
+                let rt_key = (block.micro_index.wasm_offset, block.micro_index.wasm_size);
+                let rt = if let Some(rt) = runtimes.get(&rt_key) {
+                    Arc::clone(rt)
+                } else {
+                    let mut wasm_buf = vec![0u8; block.micro_index.wasm_size as usize];
+                    self.reader
+                        .read_exact_at(&mut wasm_buf, block.micro_index.wasm_offset)?;
+                    let rt = Arc::new(
+                        Runtime::try_new(&wasm_buf)
+                            .map_err(|e| Error::General(e.to_string()))?,
+                    );
+                    runtimes.insert(rt_key, Arc::clone(&rt));
+                    rt
+                };
+                let mut out_ids = vec![0u8; k_out * std::mem::size_of::<u32>()];
+                let mut out_dists = vec![0u8; k_out * std::mem::size_of::<f32>()];
+                let centroid_bytes: &[u8] = unsafe {
+                    std::slice::from_raw_parts(
+                        blob.centroids.as_ptr() as *const u8,
+                        blob.centroids.len() * std::mem::size_of::<f32>(),
+                    )
+                };
+                let query_bytes: &[u8] = unsafe {
+                    std::slice::from_raw_parts(
+                        query.as_ptr() as *const u8,
+                        query.len() * std::mem::size_of::<f32>(),
+                    )
+                };
+                let _ = rt
+                    .call_micro_search(
+                        blob.dim,
+                        k_out as u32,
+                        centroid_bytes,
+                        query_bytes,
+                        &mut out_ids,
+                        &mut out_dists,
+                    )
+                    .map_err(|e| Error::General(e.to_string()))?;
+                let best = u32::from_le_bytes(out_ids[0..4].try_into().unwrap()) as usize;
+                let spans = blob.bucket_spans.get(best).cloned().unwrap_or_default();
+                let mut slices = vec![];
+                for (start, len) in spans {
+                    let global_start = block.row_start as usize + start as usize;
+                    let len = len as usize;
+                    slices.push(concatenated.slice(global_start, len));
+                }
+                if slices.is_empty() {
+                    // Nothing selected; return empty slice for this block.
+                    results.push(concatenated.slice(block.row_start as usize, 0));
+                } else if slices.len() == 1 {
+                    results.push(slices.remove(0));
+                } else {
+                    results.push(concat(
+                        slices.iter().map(|a| a.as_ref()).collect::<Vec<_>>().as_slice(),
+                    )?);
+                }
+            }
+        }
+        Ok(results)
     }
 
     /// Access single row id from a leaf column from potentially nested data
@@ -155,21 +312,10 @@ impl<R: Reader> FileReaderV2<R> {
         col_field: FieldRef,
         row_id: usize,
     ) -> Result<Vec<RecordBatch>> {
-        let footer = Footer::try_new_with_projection(
-            &self.row_group_cnt_n_pointers,
-            self.grouped_column_metadata_buffers
-                .iter()
-                .map(|c_buffers| {
-                    c_buffers
-                        .iter()
-                        .map(|c_buffer| c_buffer.as_ref())
-                        .collect::<Vec<_>>()
-                })
-                .collect(),
-            self.schema.clone(),
-        )?;
+        let footer = self.materialize_footer()?;
+        let mut reader = self.reader.clone();
         point_access_list_struct(
-            &mut self.reader,
+            &mut reader,
             footer,
             col_leaf_id,
             col_field,

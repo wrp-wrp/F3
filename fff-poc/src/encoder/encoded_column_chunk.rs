@@ -53,6 +53,8 @@ pub struct EncodedColumnChunk {
     pub dict_encoding: footer::DictionaryEncoding,
     /// The physical column index
     pub column_index: u32,
+    /// Optional micro-index payload to be written adjacent to the chunk.
+    pub micro_index_aux: Option<MicroIndexAux>,
 }
 
 impl Default for EncodedColumnChunk {
@@ -74,6 +76,7 @@ pub struct EncodedColumnChunkBuilder {
     pub dict_encoding: footer::DictionaryEncoding,
     /// The physical column index
     pub column_index: u32,
+    pub micro_index_aux: Option<MicroIndexAux>,
 }
 
 impl EncodedColumnChunkBuilder {
@@ -89,6 +92,7 @@ impl EncodedColumnChunkBuilder {
             num_rows: self.num_rows,
             dict_encoding: self.dict_encoding,
             column_index: self.column_index,
+            micro_index_aux: self.micro_index_aux,
         }
     }
 
@@ -105,4 +109,11 @@ impl EncodedColumnChunk {
             ..self
         }
     }
+}
+
+/// Serialized micro-index bytes to attach to a vector block.
+#[derive(Clone)]
+pub struct MicroIndexAux {
+    pub bytes: Vec<u8>,
+    pub reserved: Vec<u32>,
 }

@@ -200,10 +200,41 @@ table Chunk {
   checksum: uint64 = null;
 }
 
+/// Per-block micro-index info (e.g., mini-IVF or PQ) stored alongside data for quick filtering.
+table MicroIndex {
+  wasm_offset: uint64;
+  wasm_size: uint32;
+  abi_major: uint16;
+  abi_minor: uint16;
+  /// Optional auxiliary offset/size (e.g., codebooks/signatures) colocated in file.
+  aux_offset: uint64 = 0;
+  aux_size: uint32 = 0;
+  /// Reserved for future parameters (e.g., block-level centroid count).
+  reserved: [uint32];
+}
+
+/// Vector block layout for efficient IO and block-level filtering.
+table VectorBlock {
+  offset: uint64;
+  size: uint32;
+  row_start: uint64;
+  row_count: uint32;
+  align: uint32;
+  micro_index: MicroIndex;
+}
+
+/// Optional per-column metadata for vector columns.
+table VectorColumn {
+  blocks: [VectorBlock];
+  /// IO hint: suggested readahead/block size in bytes.
+  io_hint_bytes: uint32 = 0;
+}
+
 /// There can be many Chunks for a column inside a RowGroup.
 /// And they do not need to be contiguous.
 table ColumnMetadata {
   column_chunks: [Chunk];
+  vector_column: VectorColumn;
 }
 
 table RowGroups {

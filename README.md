@@ -83,6 +83,7 @@ The tree above highlights the crates and directories you will touch most often w
    - Use `cargo test -p fff-bench -- --ignored` to exercise benchmarks marked as ignored by default.
    - The helper scripts in `scripts/` and `exp_scripts/` automate collecting statistics for the paper; inspect them when reproducing published figures.
    - Embed additional ANN/vector indexes via `vector_index::VectorIndexConfig` and inspect them at read time with `FileReaderV2::vector_indexes()`.
+   - Run brute-force vector recall experiments by serializing blobs with `vector_index::encode_bruteforce_index` and querying them through `FileReaderV2::vector_knn_l2`.
 
 ## Important directories
 

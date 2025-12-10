@@ -46,6 +46,7 @@
    let idx = reader.vector_index("embedding").with_algo("HNSW")?;
    let neighbors = idx.query(QuerySpec::knn(query_vec, 10));
    ```
+5. 当前实现内置了 `encode_bruteforce_index` 编码器和 `FileReaderV2::vector_knn_l2` 查询入口，可直接对 brute-force 索引执行 recall 实验；其他算法可以通过自定义 blob + Wasm 扩展。
 
 ## 4. 量化与多索引策略
 

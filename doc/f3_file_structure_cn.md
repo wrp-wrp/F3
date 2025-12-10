@@ -79,7 +79,7 @@ F3 的可扩展性来自嵌入式 Wasm 解码器：
   - `QuantizationSpec`，允许按维度区间（`QuantizationSegment`）声明量化方法、bit 宽与自定义参数；
   - `custom_params`，用于存储额外的编码/量化配置。
 - Writer 通过 `VectorIndexConfig` 把索引 blob 及可选 Wasm 模块写入数据区，并在 Footer 注册 descriptor。
-- Reader 在 `FileReaderV2` 中暴露 `vector_indexes()`、`load_vector_index_blob()` 与 `load_vector_index_wasm()`，可根据 descriptor 按需读取索引或其 Wasm 实现。
+- Reader 在 `FileReaderV2` 中暴露 `vector_indexes()`、`load_vector_index_blob()` 与 `load_vector_index_wasm()`，可根据 descriptor 按需读取索引或其 Wasm 实现；`vector_knn_l2()` 可直接在内置的 brute-force 索引上执行查询并做 recall 评估。
 
 ## 6. Postscript 与校验
 

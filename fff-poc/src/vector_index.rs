@@ -1,9 +1,12 @@
 use crate::file::footer::MetadataSection;
+use byteorder::{LittleEndian, ReadBytesExt};
+use fff_core::errors::{Error, Result};
 use fff_format::File::fff::flatbuf as fb;
 use fff_format::ToFlatBuffer;
 use flatbuffers::{FlatBufferBuilder, WIPOffset};
+use std::io::Cursor;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VectorIndexAlgorithm {
     BruteForce,
     Hnsw,
@@ -33,7 +36,7 @@ impl From<fb::VectorIndexAlgorithm> for VectorIndexAlgorithm {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VectorDistanceMetric {
     L2,
     Cosine,
@@ -60,7 +63,7 @@ impl From<fb::VectorDistanceMetric> for VectorDistanceMetric {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QuantizationMethod {
     None,
     Scalar,
@@ -320,4 +323,139 @@ impl VectorIndexConfig {
             wasm_section,
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct VectorSearchResult {
+    pub row_id: u64,
+    pub distance: f32,
+}
+
+pub enum VectorIndexRuntime {
+    BruteForce(BruteForceIndex),
+}
+
+impl VectorIndexRuntime {
+    pub fn from_descriptor(desc: &VectorIndexDescriptor, bytes: &[u8]) -> Result<Self> {
+        match desc.algorithm {
+            VectorIndexAlgorithm::BruteForce => {
+                if desc.distance_metric != VectorDistanceMetric::L2 {
+                    return Err(Error::General(
+                        "Brute-force index currently supports only L2 metric".to_string(),
+                    ));
+                }
+                Ok(Self::BruteForce(BruteForceIndex::from_bytes(bytes)?))
+            }
+            other => Err(Error::General(format!(
+                "Vector algorithm {:?} is not supported",
+                other
+            ))),
+        }
+    }
+
+    pub fn knn_l2(&self, query: &[f32], k: usize) -> Result<Vec<VectorSearchResult>> {
+        match self {
+            Self::BruteForce(index) => index.knn_l2(query, k),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct BruteForceIndex {
+    dimension: usize,
+    num_vectors: usize,
+    values: Vec<f32>,
+}
+
+impl BruteForceIndex {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < 8 {
+            return Err(Error::General(
+                "Vector index blob too small for header".to_string(),
+            ));
+        }
+        let num_vectors = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+        let dimension = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+        let expected = 8 + num_vectors
+            .checked_mul(dimension)
+            .ok_or_else(|| Error::General("Vector index size overflow".to_string()))?
+            .checked_mul(4)
+            .ok_or_else(|| Error::General("Vector index size overflow".to_string()))?;
+        if bytes.len() != expected {
+            return Err(Error::General(format!(
+                "Vector index blob size mismatch. expected {}, got {}",
+                expected,
+                bytes.len()
+            )));
+        }
+        let mut values = Vec::with_capacity(num_vectors * dimension);
+        let mut cursor = Cursor::new(&bytes[8..]);
+        for _ in 0..num_vectors * dimension {
+            values.push(
+                cursor
+                    .read_f32::<LittleEndian>()
+                    .map_err(|e| Error::General(format!("Unable to read vector value: {e}")))?,
+            );
+        }
+        Ok(Self {
+            dimension,
+            num_vectors,
+            values,
+        })
+    }
+
+    pub fn knn_l2(&self, query: &[f32], k: usize) -> Result<Vec<VectorSearchResult>> {
+        if query.len() != self.dimension {
+            return Err(Error::General(format!(
+                "Query dimension {} does not match index dimension {}",
+                query.len(),
+                self.dimension
+            )));
+        }
+        let mut results = Vec::with_capacity(self.num_vectors);
+        for row in 0..self.num_vectors {
+            let base = row * self.dimension;
+            let mut dist = 0.0f32;
+            for d in 0..self.dimension {
+                let diff = self.values[base + d] - query[d];
+                dist += diff * diff;
+            }
+            results.push(VectorSearchResult {
+                row_id: row as u64,
+                distance: dist,
+            });
+        }
+        results.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap());
+        let limit = k.min(results.len());
+        results.truncate(limit);
+        Ok(results)
+    }
+}
+
+pub fn encode_bruteforce_index(vectors: &[Vec<f32>]) -> Result<Vec<u8>> {
+    if vectors.is_empty() {
+        return Err(Error::General(
+            "Cannot build vector index with zero vectors".to_string(),
+        ));
+    }
+    let dimension = vectors[0].len();
+    if dimension == 0 {
+        return Err(Error::General(
+            "Vector dimension must be greater than 0".to_string(),
+        ));
+    }
+    if vectors.iter().any(|v| v.len() != dimension) {
+        return Err(Error::General(
+            "All vectors must share the same dimension".to_string(),
+        ));
+    }
+    let mut buffer = Vec::with_capacity(8 + vectors.len() * dimension * 4);
+    buffer.extend_from_slice(&(vectors.len() as u32).to_le_bytes());
+    buffer.extend_from_slice(&(dimension as u32).to_le_bytes());
+    for vec in vectors {
+        for value in vec {
+            buffer.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    Ok(buffer)
 }

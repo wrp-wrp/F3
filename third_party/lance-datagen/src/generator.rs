@@ -686,9 +686,10 @@ impl ArrayGenerator for RandomBinaryGenerator {
         }
         let bytes = Buffer::from_vec(bytes);
         if self.is_large {
-            let offsets = OffsetBuffer::from_lengths(
-                std::iter::repeat_n(self.bytes_per_element.0 as usize, length.0 as usize),
-            );
+            let offsets = OffsetBuffer::from_lengths(std::iter::repeat_n(
+                self.bytes_per_element.0 as usize,
+                length.0 as usize,
+            ));
             if self.scale_to_utf8 {
                 // This is safe because we are only using printable characters
                 unsafe {
@@ -704,9 +705,10 @@ impl ArrayGenerator for RandomBinaryGenerator {
                 }
             }
         } else {
-            let offsets = OffsetBuffer::from_lengths(
-                std::iter::repeat_n(self.bytes_per_element.0 as usize, length.0 as usize),
-            );
+            let offsets = OffsetBuffer::from_lengths(std::iter::repeat_n(
+                self.bytes_per_element.0 as usize,
+                length.0 as usize,
+            ));
             if self.scale_to_utf8 {
                 // This is safe because we are only using printable characters
                 unsafe {

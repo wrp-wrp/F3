@@ -10,12 +10,14 @@ fn main() -> Result<()> {
     );
 
     // compile flatc if it does not exist
-    if flatc.check().is_err() && !Command::new("sh")
+    if flatc.check().is_err()
+        && !Command::new("sh")
             .current_dir(Path::new(&env::var("CARGO_MANIFEST_DIR").unwrap()).join(".."))
             .args(["scripts/install_flatc.sh"])
             .status()
             .with_context(|| "install_flatc.sh failed")?
-            .success() {
+            .success()
+    {
         anyhow::bail!("install_flatc.sh failed");
     }
 

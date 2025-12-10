@@ -68,9 +68,7 @@ impl<R: Reader> ChunkDecoder for NoDictColDecoder<'_, R> {
             data.freeze(),
             encblock_fb.num_rows() as u64,
             self.data_type.clone(),
-            self.wasm_context
-                .as_ref()
-                .map(Arc::clone),
+            self.wasm_context.as_ref().map(Arc::clone),
         )?;
         decoder.decode().map(Some)
     }
@@ -101,9 +99,7 @@ impl<R: Reader> ChunkDecoder for NoDictColDecoder<'_, R> {
                     data.freeze(),
                     enc_unit_num_rows as u64,
                     self.data_type.clone(),
-                    self.wasm_context
-                        .as_ref()
-                        .map(Arc::clone),
+                    self.wasm_context.as_ref().map(Arc::clone),
                 )?;
                 // Return the array with only one element at the given index.
                 let array = match decoder.slice(idx, idx + to_decode) {
@@ -286,9 +282,7 @@ impl<R: Reader> ChunkDecoder for DictColDecoder<'_, R> {
             dict.freeze(),
             dict_encblock_fb.num_rows() as u64,
             self.data_type.clone(),
-            self.wasm_context
-                .as_ref()
-                .map(Arc::clone),
+            self.wasm_context.as_ref().map(Arc::clone),
         )?;
         let dict = if dict_encblock_fb.num_rows() > 0 {
             dict_decoder.decode()?
@@ -310,9 +304,7 @@ impl<R: Reader> ChunkDecoder for DictColDecoder<'_, R> {
             indices.freeze(),
             index_encblock_fb.num_rows() as u64,
             DataType::Int64,
-            self.wasm_context
-                .as_ref()
-                .map(Arc::clone),
+            self.wasm_context.as_ref().map(Arc::clone),
         )?;
         let indices_ref = indices_decoder.decode()?;
         let indices = indices_ref.as_any().downcast_ref::<UInt64Array>().ok_or(
@@ -432,9 +424,7 @@ impl<R: Reader> ChunkDecoder for SharedDictColDecoder<'_, R> {
             indices.freeze(),
             index_encblock_fb.num_rows() as u64,
             DataType::Int64,
-            self.wasm_context
-                .as_ref()
-                .map(Arc::clone),
+            self.wasm_context.as_ref().map(Arc::clone),
         )?;
         let indices = indices_decoder.decode()?;
         let dict = &self.shared_dictionary;

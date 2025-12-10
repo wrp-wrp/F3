@@ -6,7 +6,7 @@ use crate::{
     dict::shared_dictionary_cache::SharedDictionaryCache,
     file::footer::{Footer, GroupedColumnMetadata, MetadataSection, PostScript},
     io::reader::Reader,
-    vector_index::VectorIndexDescriptor,
+    vector_index::{VectorIndexDescriptor, VectorIndexRuntime, VectorSearchResult},
 };
 use arrow::compute::concat;
 use arrow_array::RecordBatch;
@@ -124,6 +124,27 @@ impl<R: Reader> FileReaderV2<R> {
             .find(|desc| desc.index_id == index_id)
             .and_then(|desc| desc.wasm_section().cloned());
         self.read_metadata_section(section)
+    }
+
+    pub fn vector_knn_l2(
+        &mut self,
+        index_id: u32,
+        query: &[f32],
+        k: usize,
+    ) -> Result<Vec<VectorSearchResult>> {
+        let descriptor = self
+            .vector_indexes
+            .iter()
+            .find(|desc| desc.index_id == index_id)
+            .cloned()
+            .ok_or_else(|| {
+                Error::General(format!("Vector index {} not found in footer", index_id))
+            })?;
+        let blob = self
+            .load_vector_index_blob(index_id)?
+            .ok_or_else(|| Error::General(format!("Vector index blob {} is missing", index_id)))?;
+        let runtime = VectorIndexRuntime::from_descriptor(&descriptor, &blob)?;
+        runtime.knn_l2(query, k)
     }
 
     pub fn read_file(&mut self) -> Result<Vec<RecordBatch>> {

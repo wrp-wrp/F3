@@ -159,6 +159,7 @@ impl<R: Reader + Clone> FileReaderV2Builder<R> {
             shared_dict_table,
             optional_sections,
             encoding_versions,
+            vector_indexes,
         ) = parse_footer(&footer_fbs)?;
         // Depending on the ratio between number of projected columns and total columns,
         // we fetch them all or do one by one fetch.
@@ -216,11 +217,7 @@ impl<R: Reader + Clone> FileReaderV2Builder<R> {
         for rg_meta_fbs in row_group_metadata_fbs.iter() {
             let mut column_metadata_buffers: Vec<Bytes> = vec![];
             let column_meta_ptrs = match self.projections {
-                Projection::All => rg_meta_fbs
-                    .col_metadatas()
-                    .unwrap()
-                    .into_iter()
-                    .collect(),
+                Projection::All => rg_meta_fbs.col_metadatas().unwrap().into_iter().collect(),
                 Projection::LeafColumnIndexes(ref projections) => {
                     let mut column_meta_offsets = vec![];
                     for i in projections {
@@ -296,6 +293,7 @@ impl<R: Reader + Clone> FileReaderV2Builder<R> {
             checksum_type: self
                 .verify_io_unit_checksum
                 .then_some(post_script.checksum_type),
+            vector_indexes,
         })
     }
 }

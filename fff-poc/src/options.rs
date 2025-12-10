@@ -7,6 +7,7 @@ pub use crate::dict::DictionaryTypeOptions;
 use crate::{
     common::checksum::ChecksumType,
     context::{WASMId, WASMWritingContext, WasmLib},
+    vector_index::VectorIndexConfig,
 };
 
 pub const DEFAULT_IOUNIT_SIZE: u64 = 8 * 1024 * 1024; // in bytes
@@ -37,6 +38,8 @@ pub struct FileWriterOptions {
     enable_io_unit_checksum: bool,
     /// The type of compression to use for EncUnits
     compression_type: CompressionType,
+    /// Vector index descriptors to embed in the file.
+    vector_indexes: Vec<VectorIndexConfig>,
 }
 
 impl Default for FileWriterOptions {
@@ -97,6 +100,14 @@ impl FileWriterOptions {
     pub fn compression_type(&self) -> CompressionType {
         self.compression_type
     }
+
+    pub fn vector_indexes(&self) -> &[VectorIndexConfig] {
+        &self.vector_indexes
+    }
+
+    pub fn take_vector_indexes(&mut self) -> Vec<VectorIndexConfig> {
+        std::mem::take(&mut self.vector_indexes)
+    }
 }
 
 pub struct FileWriterOptionsBuilder {
@@ -125,6 +136,7 @@ pub struct FileWriterOptionsBuilder {
     enable_io_unit_checksum: bool,
     /// The type of compression to use for EncUnits
     compression_type: CompressionType,
+    vector_indexes: Vec<VectorIndexConfig>,
 }
 
 impl FileWriterOptionsBuilder {
@@ -141,6 +153,7 @@ impl FileWriterOptionsBuilder {
             dictionary_type: DictionaryTypeOptions::EncoderDictionary,
             enable_io_unit_checksum: false,
             compression_type: CompressionType::Uncompressed,
+            vector_indexes: Vec::new(),
         }
     }
 
@@ -159,6 +172,7 @@ impl FileWriterOptionsBuilder {
             dictionary_type: self.dictionary_type,
             enable_io_unit_checksum: self.enable_io_unit_checksum,
             compression_type: self.compression_type,
+            vector_indexes: self.vector_indexes,
         }
     }
 
@@ -212,6 +226,11 @@ impl FileWriterOptionsBuilder {
 
     pub fn set_compression_type(mut self, compression_type: CompressionType) -> Self {
         self.compression_type = compression_type;
+        self
+    }
+
+    pub fn add_vector_index(mut self, config: VectorIndexConfig) -> Self {
+        self.vector_indexes.push(config);
         self
     }
 }

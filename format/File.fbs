@@ -144,6 +144,54 @@ table WASMBinaries {
   // colophons: [Colophon];
 }
 
+/// ----------------------------------------------------------------------
+/// Vector index metadata.
+enum VectorIndexAlgorithm:uint8 {
+  BRUTE_FORCE = 0,
+  HNSW = 1,
+  IVF = 2,
+  CUSTOM_WASM = 255,
+}
+
+enum VectorDistanceMetric:uint8 {
+  L2 = 0,
+  COSINE = 1,
+  DOT = 2,
+}
+
+enum VectorQuantizationMethod:uint8 {
+  NONE = 0,
+  SCALAR = 1,
+  PRODUCT = 2,
+  CUSTOM = 255,
+}
+
+table QuantizationSegment {
+  start_dim: uint32;
+  end_dim: uint32;
+  method: VectorQuantizationMethod;
+  bits: uint8;
+  params: [ubyte];
+}
+
+table QuantizationSpec {
+  dimension: uint32;
+  segments: [QuantizationSegment];
+}
+
+table VectorIndexDescriptor {
+  index_id: uint32;
+  column: string;
+  algorithm: VectorIndexAlgorithm;
+  metric: VectorDistanceMetric;
+  priority: uint16;
+  usage_hint: string;
+  data_section: MetadataSection;
+  wasm_section: MetadataSection;
+  quantization: QuantizationSpec;
+  custom_params: [ubyte];
+}
+
 /// Encoding used at the EncUnit level.
 /// 1. If the encoding is supported by the reader (e.g., PLAIN), the reader can directly read the data.
 /// 2. If the encoding is not supported by the reader, but a wasm_encoding is provided, reader can use WASM
@@ -272,6 +320,9 @@ table Footer {
 
   /// The table to shared dictionary IOUnits and IOUnit IDs each shared dictionary contains
   shared_dictionary_table: SharedDictionaryTable;
+
+  /// Optional vector index descriptors defined for columns.
+  vector_indexes: [VectorIndexDescriptor];
 }
 
 root_type Footer;

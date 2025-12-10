@@ -82,6 +82,7 @@ The tree above highlights the crates and directories you will touch most often w
    - Modify encoding logic in `fff-encoding/` or Wasm adapters under `fff-ude-wasm/wasm/*.rs`, then rerun the `fff-poc` tests.
    - Use `cargo test -p fff-bench -- --ignored` to exercise benchmarks marked as ignored by default.
    - The helper scripts in `scripts/` and `exp_scripts/` automate collecting statistics for the paper; inspect them when reproducing published figures.
+   - Embed additional ANN/vector indexes via `vector_index::VectorIndexConfig` and inspect them at read time with `FileReaderV2::vector_indexes()`.
 
 ## Important directories
 

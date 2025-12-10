@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::convert::TryFrom;
 use std::io::{BufWriter, Seek, Write};
 use std::iter::once;
 use std::sync::Arc;
@@ -26,10 +27,16 @@ use crate::encoder::encoded_column_chunk::EncodedColumnChunk;
 use crate::encoder::logical::LogicalColEncoder;
 use crate::encoder::logical::{create_logical_encoder, LogicalTree};
 use crate::file::footer::create_default_encoding_versions;
-use crate::file::footer::{self, Chunk, ColumnMetadata, RowGroupMetadata, RowGroupsTable};
+use crate::file::footer::{
+    self, Chunk, ColumnMetadata, MetadataSection, RowGroupMetadata, RowGroupsTable,
+};
 use crate::options::FileWriterOptions;
+use crate::vector_index::{VectorIndexConfig, VectorIndexDescriptor};
 
-use fff_core::{errors::Result, nyi_err};
+use fff_core::{
+    errors::{Error, Result},
+    nyi_err,
+};
 
 struct FileWriteState<W: Write + Seek> {
     writer: BufWriter<W>,
@@ -179,6 +186,7 @@ pub struct FileWriter<W: Write + Seek> {
     custom_encunit_len: HashMap<usize, usize>,
     row_group_size: u64,
     shared_dictionary_context: SharedDictionaryContext,
+    vector_indexes: Vec<VectorIndexConfig>,
 }
 
 impl<W: Write + Seek> FileWriter<W> {
@@ -243,6 +251,7 @@ impl<W: Write + Seek> FileWriter<W> {
             custom_encunit_len: options.custom_encunit_len().clone(),
             row_group_size: options.row_group_size(),
             shared_dictionary_context,
+            vector_indexes: options.take_vector_indexes(),
         })
     }
 
@@ -310,6 +319,7 @@ impl<W: Write + Seek> FileWriter<W> {
     }
 
     pub fn finish(mut self) -> Result<Vec<EncodingCounter>> {
+        let vector_configs = std::mem::take(&mut self.vector_indexes);
         // if dictionary mode is global with sharing, first submit all values to dictionary context
         if self.shared_dictionary_context.is_multi_col_sharing() {
             for encoder in self.column_encoders.iter_mut() {
@@ -365,6 +375,8 @@ impl<W: Write + Seek> FileWriter<W> {
         let wasm_meta_start = self.state.writer.stream_position()?;
         self.state.write_and_update_file_level_checksum(wasms)?;
         let wasm_meta_size = self.state.writer.stream_position()? - wasm_meta_start;
+
+        let vector_index_descriptors = self.write_vector_indexes(vector_configs)?;
 
         // write ColumnMetadata and update indirect_row_group_metadata
         let metadata_start = self
@@ -469,6 +481,16 @@ impl<W: Write + Seek> FileWriter<W> {
             .collect::<Vec<_>>();
         let encoding_versions_fb = fbb.create_vector(&encoding_versions_fb);
 
+        let vector_index_fb_offsets = vector_index_descriptors
+            .iter()
+            .map(|desc| desc.to_fb(&mut fbb))
+            .collect::<Vec<_>>();
+        let vector_index_fb = if vector_index_fb_offsets.is_empty() {
+            None
+        } else {
+            Some(fbb.create_vector(&vector_index_fb_offsets))
+        };
+
         let footer = {
             let mut footer_builder = fb::FooterBuilder::new(&mut fbb);
             footer_builder.add_schema(schema);
@@ -477,6 +499,9 @@ impl<W: Write + Seek> FileWriter<W> {
             footer_builder.add_optional_sections(optional_metadata_section);
             footer_builder.add_shared_dictionary_table(shared_dict_table);
             footer_builder.add_encoding_versions(encoding_versions_fb);
+            if let Some(vector_fb) = vector_index_fb {
+                footer_builder.add_vector_indexes(vector_fb);
+            }
             footer_builder.finish()
         };
         fbb.finish(footer, None);
@@ -500,5 +525,45 @@ impl<W: Write + Seek> FileWriter<W> {
         writer.write_all(MAGIC)?;
         writer.flush()?;
         Ok(self.state.column_counters)
+    }
+
+    fn write_vector_indexes(
+        &mut self,
+        configs: Vec<VectorIndexConfig>,
+    ) -> Result<Vec<VectorIndexDescriptor>> {
+        let mut descriptors = Vec::with_capacity(configs.len());
+        for mut cfg in configs {
+            let data_section = if cfg.data.is_empty() {
+                None
+            } else {
+                let offset = self.state.writer.stream_position()?;
+                self.state
+                    .write_and_update_file_level_checksum(cfg.data.as_slice())?;
+                let size = u32::try_from(cfg.data.len()).map_err(|_| {
+                    Error::General("Vector index blob exceeds 4GiB limit".to_string())
+                })?;
+                Some(MetadataSection {
+                    offset,
+                    size,
+                    compression_type: CompressionType::Uncompressed,
+                })
+            };
+            let wasm_section = if let Some(wasm) = cfg.wasm_module.take() {
+                let offset = self.state.writer.stream_position()?;
+                self.state.write_and_update_file_level_checksum(&wasm)?;
+                let size = u32::try_from(wasm.len()).map_err(|_| {
+                    Error::General("Vector index Wasm blob exceeds 4GiB limit".to_string())
+                })?;
+                Some(MetadataSection {
+                    offset,
+                    size,
+                    compression_type: CompressionType::Uncompressed,
+                })
+            } else {
+                None
+            };
+            descriptors.push(cfg.into_descriptor(data_section, wasm_section));
+        }
+        Ok(descriptors)
     }
 }

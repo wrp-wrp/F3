@@ -71,7 +71,17 @@ F3 的可扩展性来自嵌入式 Wasm 解码器：
 
 这种设计允许新的编码算法无需升级核心库即可在文件内部发布。
 
-## 5. Postscript 与校验
+## 5. 向量索引与量化
+
+- Footer 追加 `vector_indexes: [VectorIndexDescriptor]`。每个 descriptor 指向：
+  - 索引的目标列、算法、距离度量、优先级及 `usage_hint`；
+  - `data_section`（索引主体）与 `wasm_section`（可选索引逻辑）的 `MetadataSection`；
+  - `QuantizationSpec`，允许按维度区间（`QuantizationSegment`）声明量化方法、bit 宽与自定义参数；
+  - `custom_params`，用于存储额外的编码/量化配置。
+- Writer 通过 `VectorIndexConfig` 把索引 blob 及可选 Wasm 模块写入数据区，并在 Footer 注册 descriptor。
+- Reader 在 `FileReaderV2` 中暴露 `vector_indexes()`、`load_vector_index_blob()` 与 `load_vector_index_wasm()`，可根据 descriptor 按需读取索引或其 Wasm 实现。
+
+## 6. Postscript 与校验
 
 Postscript 的布局（均为小端）：
 
@@ -89,7 +99,7 @@ Postscript 的布局（均为小端）：
 
 Reader 首先读取末尾固定大小的 Postscript，进而一次性请求 [metadata_size] 范围的数据，无需随机 I/O 多次跳转。
 
-## 6. 读写流程概览
+## 7. 读写流程概览
 
 **写入**（`fff-poc::writer`）：
 1. 根据输入的 Arrow RecordBatch/Array，将列数据编码为 EncUnit，顺序写入列块区域，同时累积 `data_checksum`。
@@ -104,7 +114,7 @@ Reader 首先读取末尾固定大小的 Postscript，进而一次性请求 [met
 3. 根据投影/筛选需要，定位并加载列元数据，再按 EncUnit 读取数据块；当遇到 `EncodingType::CUSTOM_WASM` 或未内置的编码时，加载相应的 Wasm 模块执行解码。
 4. 根据 Schema 恢复 Arrow 数组或执行自定义计算。
 
-## 7. 参考目录
+## 8. 参考目录
 
 - `format/File.fbs`：格式权威定义。
 - `fff-format/`：由 FlatBuffer 生成的 Rust 绑定。

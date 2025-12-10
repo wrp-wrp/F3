@@ -17,6 +17,7 @@ use fff_format::File::fff::flatbuf as fb;
 use crate::common::checksum::Checksum;
 use crate::common::checksum::ChecksumType;
 use crate::reader::RowGroupCntNPointer;
+use crate::vector_index::VectorIndexDescriptor;
 use fff_core::errors::{Error, Result};
 
 /// Default encoding versions map
@@ -461,7 +462,7 @@ impl ToFlatBuffer for EncUnit {
 
 /// Metadata section pointer for writer.
 /// Reader should use [MetadataSectionFBS](fff_format::File::fff::flatbuf::MetadataSection) directly.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct MetadataSection {
     pub offset: u64,
     pub size: u32,
@@ -695,7 +696,7 @@ impl<'a> Footer<'a> {
             root_as_footer(&buf[(post_script.metadata_size - post_script.footer_size) as usize..])
                 .map_err(|e| Error::ParseError(format!("Unable to get root as footer: {e:?}")))?;
         // FIXME: use logical tree to know which logical encoding to use.
-        let (schema, _logical_tree, row_groups_pointer, _shared_dict, _, _) =
+        let (schema, _logical_tree, row_groups_pointer, _shared_dict, _, _, _) =
             parse_footer(&footer_fbs)?;
         let row_group_metadata_fbs = row_groups_pointer
             .row_group_metadatas()
@@ -769,6 +770,7 @@ pub fn parse_footer<'a>(
     Option<fb::SharedDictionaryTable<'a>>,
     Option<fb::OptionalMetadataSections<'a>>,
     Option<HashMap<fb::EncodingType, Version>>,
+    Vec<VectorIndexDescriptor>,
 )> {
     let schema_bytes = footer_fbs
         .schema()
@@ -801,6 +803,16 @@ pub fn parse_footer<'a>(
         map
     });
 
+    let vector_indexes = footer_fbs
+        .vector_indexes()
+        .map(|indexes| {
+            indexes
+                .iter()
+                .map(|desc| VectorIndexDescriptor::from(&desc))
+                .collect()
+        })
+        .unwrap_or_default();
+
     Ok((
         schema,
         logical_tree,
@@ -808,5 +820,6 @@ pub fn parse_footer<'a>(
         shared_dict,
         footer_fbs.optional_sections(),
         encoding_versions,
+        vector_indexes,
     ))
 }

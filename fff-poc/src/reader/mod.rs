@@ -4,8 +4,9 @@ use crate::{
     counter::EncodingCounter,
     decoder::logical::{create_list_struct_decoder, create_logical_decoder},
     dict::shared_dictionary_cache::SharedDictionaryCache,
-    file::footer::{Footer, GroupedColumnMetadata, PostScript},
+    file::footer::{Footer, GroupedColumnMetadata, MetadataSection, PostScript},
     io::reader::Reader,
+    vector_index::VectorIndexDescriptor,
 };
 use arrow::compute::concat;
 use arrow_array::RecordBatch;
@@ -95,11 +96,34 @@ pub struct FileReaderV2<R> {
     shared_dictionary_cache: Option<SharedDictionaryCache>,
     /// Whether we verify the IOUnit checksum.
     checksum_type: Option<ChecksumType>,
+    vector_indexes: Vec<VectorIndexDescriptor>,
 }
 
 impl<R: Reader> FileReaderV2<R> {
     pub fn schema(&self) -> SchemaRef {
         self.schema.clone()
+    }
+
+    pub fn vector_indexes(&self) -> &[VectorIndexDescriptor] {
+        &self.vector_indexes
+    }
+
+    pub fn load_vector_index_blob(&mut self, index_id: u32) -> Result<Option<Vec<u8>>> {
+        let section = self
+            .vector_indexes
+            .iter()
+            .find(|desc| desc.index_id == index_id)
+            .and_then(|desc| desc.data_section().cloned());
+        self.read_metadata_section(section)
+    }
+
+    pub fn load_vector_index_wasm(&mut self, index_id: u32) -> Result<Option<Vec<u8>>> {
+        let section = self
+            .vector_indexes
+            .iter()
+            .find(|desc| desc.index_id == index_id)
+            .and_then(|desc| desc.wasm_section().cloned());
+        self.read_metadata_section(section)
     }
 
     pub fn read_file(&mut self) -> Result<Vec<RecordBatch>> {
@@ -177,6 +201,24 @@ impl<R: Reader> FileReaderV2<R> {
             self.wasm_context.clone(),
             self.shared_dictionary_cache.as_ref(),
         )
+    }
+
+    fn read_metadata_section(
+        &mut self,
+        section: Option<MetadataSection>,
+    ) -> Result<Option<Vec<u8>>> {
+        if let Some(section) = section {
+            if section.compression_type != CompressionType::Uncompressed {
+                return Err(Error::General(
+                    "Compressed vector index metadata is not supported".to_string(),
+                ));
+            }
+            let mut buffer = vec![0u8; section.size as usize];
+            self.reader.read_exact_at(&mut buffer, section.offset)?;
+            Ok(Some(buffer))
+        } else {
+            Ok(None)
+        }
     }
 }
 

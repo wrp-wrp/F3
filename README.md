@@ -8,7 +8,9 @@ F3 is a data file format that is designed with efficiency, interoperability, and
 
 ## Build instructions
 
-We only tested on an Intel machine with Debian 12.
+We primarily tested on Debian 12, but you can set up macOS hosts with the steps below.
+
+### Debian 12
 
 ```shell
 git submodule update --init --recursive
@@ -16,6 +18,15 @@ git submodule update --init --recursive
 # build the PoC package of F3
 cargo build -p fff-poc
 # run unit test for F3
+cargo test -p fff-poc
+```
+
+### macOS (Intel & Apple Silicon)
+
+```shell
+git submodule update --init --recursive
+./scripts/setup_macos.sh
+cargo build -p fff-poc
 cargo test -p fff-poc
 ```
 

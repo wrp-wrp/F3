@@ -25,13 +25,17 @@ fn vector_index_metadata_roundtrip() {
     )
     .unwrap();
 
-    let vector_data = encode_bruteforce_index(&vec![
+    let source_vectors = vec![
         vec![0.0, 0.0],
         vec![1.0, 0.0],
         vec![0.0, 1.0],
         vec![1.0, 1.0],
-    ])
-    .unwrap();
+        vec![0.5, 0.5],
+        vec![0.2, 0.9],
+        vec![0.9, 0.2],
+        vec![0.3, 0.3],
+    ];
+    let vector_data = encode_bruteforce_index(&source_vectors).unwrap();
 
     let vector_config = VectorIndexConfig {
         index_id: 7,
@@ -89,14 +93,49 @@ fn vector_index_metadata_roundtrip() {
         "Wasm blob should be absent for this test"
     );
 
-    // Brute-force KNN search should recover the closest vector exactly (recall@1 = 1.0).
-    let query = [0.9_f32, 0.1_f32];
-    let results = reader.vector_knn_l2(7, &query, 2).unwrap();
-    assert_eq!(results.len(), 2);
-    assert_eq!(results[0].row_id, 1);
-    let recall_at_1: f32 = if results[0].row_id == 1 { 1.0 } else { 0.0 };
-    assert!(
-        (recall_at_1 - 1.0_f32).abs() < f32::EPSILON,
-        "recall@1 should be 1.0 for brute-force index"
-    );
+    // Brute-force KNN search should match ground truth for a variety of queries.
+    let queries = vec![[0.9_f32, 0.1_f32], [0.05, 0.05], [0.95, 0.1], [0.25, 0.85]];
+    for query in queries {
+        let actual = reader.vector_knn_l2(7, &query, 3).unwrap();
+        let expected = brute_force_knn(&source_vectors, &query, 3);
+        assert_eq!(
+            actual.len(),
+            expected.len(),
+            "result length mismatch for query {:?}",
+            query
+        );
+        for (res, exp) in actual.iter().zip(expected.iter()) {
+            assert_eq!(
+                res.row_id, exp.0 as u64,
+                "row id mismatch for query {:?}",
+                query
+            );
+            assert!(
+                (res.distance - exp.1).abs() < 1e-6,
+                "distance mismatch for query {:?}",
+                query
+            );
+        }
+    }
+}
+
+fn brute_force_knn(vectors: &[Vec<f32>], query: &[f32], k: usize) -> Vec<(usize, f32)> {
+    let mut pairs: Vec<(usize, f32)> = vectors
+        .iter()
+        .enumerate()
+        .map(|(idx, vec)| {
+            let dist = vec
+                .iter()
+                .zip(query.iter())
+                .map(|(a, b)| {
+                    let diff = a - b;
+                    diff * diff
+                })
+                .sum();
+            (idx, dist)
+        })
+        .collect();
+    pairs.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+    pairs.truncate(k.min(pairs.len()));
+    pairs
 }

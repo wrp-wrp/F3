@@ -30,6 +30,59 @@ cargo build -p fff-poc
 cargo test -p fff-poc
 ```
 
+## Project Structure
+
+```text
+F3/
+├─ doc/                         # Design notes, logo, and paper reproduction guide
+├─ format/                      # FlatBuffer schema that defines the F3 on-disk layout
+├─ fff-core/                    # Columnar primitives shared by the PoC and encoders
+├─ fff-encoding/                # Built-in logical and physical encoding implementations
+├─ fff-format/                  # Generated Rust bindings from the FlatBuffer schema
+├─ fff-poc/                     # PoC crate exposing readers/writers and integration tests
+├─ fff-ude/                     # User-defined encoding host interfaces (Rust side)
+├─ fff-ude-wasm/                # Default Wasm decoders shipped inside every file
+├─ wasm-libs/                   # Sample Wasm-based encoders/decoders for experiments
+├─ fff-bench/                   # CLI utilities and experiments used in the research paper
+├─ exp_scripts/                 # Reproduction automation for the published benchmarks
+├─ scripts/                     # Platform setup helpers (Debian/macOS) and tooling
+└─ third_party/                 # External projects vendored for reproducibility (e.g., Lance)
+```
+
+The tree above highlights the crates and directories you will touch most often when extending the file format or when building new experiments.
+
+## Usage
+
+1. **Environment setup**  
+   Clone the repo, pull submodules, and run the platform-specific setup script (`scripts/setup_debian.sh` or `scripts/setup_macos.sh`). These scripts install Rust, emsdk, Binaryen, and the compiler toolchain needed for the Wasm components.
+
+2. **Build & test**  
+   Build the PoC crate and run its full test suite (including integration tests and doctests):
+   ```shell
+   cargo build -p fff-poc
+   cargo test  -p fff-poc
+   ```
+   The long-running `e2e` tests perform multi-row-group validation; expect them to take ~2–3 minutes on a laptop.
+
+3. **Run experiments or benchmarks**  
+   The `fff-bench` crate exposes several Clap-powered binaries under `fff-bench/examples`. For example, you can compute compressed sizes for all bundled benchmark datasets or measure scan time against a particular format:
+   ```shell
+   # Print the available subcommands
+   cargo run -p fff-bench --example bench -- --help
+
+   # Re-encode benchmark datasets into every supported format
+   cargo run -p fff-bench --example bench -- compressed-size
+
+   # Compare scan latency for a given format (e.g., parquet, lance, fff)
+   cargo run -p fff-bench --example bench -- scan-time --format fff
+   ```
+   Some commands expect local copies of the datasets referenced in `fff-bench::bench_data`; see `fff-bench/examples/README.md` and `doc/paper_reproduction.md` for dataset download instructions.
+
+4. **Debug & develop**  
+   - Modify encoding logic in `fff-encoding/` or Wasm adapters under `fff-ude-wasm/wasm/*.rs`, then rerun the `fff-poc` tests.
+   - Use `cargo test -p fff-bench -- --ignored` to exercise benchmarks marked as ignored by default.
+   - The helper scripts in `scripts/` and `exp_scripts/` automate collecting statistics for the paper; inspect them when reproducing published figures.
+
 ## Important directories
 
 [format](format): FlatBuffer definition of the file format.

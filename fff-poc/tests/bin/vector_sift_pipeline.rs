@@ -73,6 +73,10 @@ struct Args {
     /// Compare against the native HNSW runtime (same index blob, no Wasm).
     #[arg(long)]
     compare_native: bool,
+
+    /// Number of queries to bundle per Wasm call (1 = disabled).
+    #[arg(long, default_value_t = 1)]
+    wasm_batch_size: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -105,6 +109,7 @@ struct RunVariantArgs<'a> {
     output_blob: Option<PathBuf>,
     output_file: Option<PathBuf>,
     available_rows: usize,
+    wasm_batch_size: usize,
 }
 
 fn main() -> Result<()> {
@@ -142,6 +147,11 @@ fn main() -> Result<()> {
         "Base dimension ({}) != query dimension ({})",
         base_vectors[0].len(),
         queries[0].len()
+    );
+
+    ensure!(
+        args.wasm_batch_size >= 1,
+        "--wasm-batch-size must be at least 1"
     );
 
     let pipeline_algo = parse_algorithm(&args.algorithm)?;
@@ -185,6 +195,7 @@ fn main() -> Result<()> {
         output_blob: args.output_blob.clone(),
         output_file: args.output_file.clone(),
         available_rows: base_vectors.len(),
+        wasm_batch_size: args.wasm_batch_size,
     })?;
     print_variant_report(&primary_report);
 
@@ -202,6 +213,7 @@ fn main() -> Result<()> {
             output_blob: None,
             output_file: None,
             available_rows: base_vectors.len(),
+            wasm_batch_size: 1,
         })?;
         print_variant_report(&baseline_report);
         print_comparison(&primary_report, &baseline_report);
@@ -243,11 +255,13 @@ fn run_variant(args: RunVariantArgs<'_>) -> Result<VariantReport> {
         output_blob,
         output_file,
         available_rows,
+        wasm_batch_size,
     } = args;
 
     if matches!(algorithm, PipelineAlgorithm::Wasm) && wasm_module.is_none() {
         bail!("Wasm module bytes missing for Wasm pipeline run");
     }
+    let use_batch = matches!(algorithm, PipelineAlgorithm::Wasm) && wasm_batch_size > 1;
 
     let build_start = Instant::now();
     let index_blob = match algorithm {
@@ -321,9 +335,20 @@ fn run_variant(args: RunVariantArgs<'_>) -> Result<VariantReport> {
     map_vector_result(writer.finish())?;
 
     let mut reader = map_vector_result(FileReaderV2Builder::new(file_handle.clone()).build())?;
-    let stats = evaluate_recall(queries, truth, k, available_rows, |query, k| {
-        map_vector_result(reader.vector_knn_l2(VECTOR_INDEX_ID, query, k))
-    })?;
+    let stats = if use_batch {
+        evaluate_recall_batch(
+            queries,
+            truth,
+            k,
+            available_rows,
+            wasm_batch_size,
+            |batch, k| map_vector_result(reader.vector_knn_l2_batch(VECTOR_INDEX_ID, batch, k)),
+        )?
+    } else {
+        evaluate_recall(queries, truth, k, available_rows, |query, k| {
+            map_vector_result(reader.vector_knn_l2(VECTOR_INDEX_ID, query, k))
+        })?
+    };
 
     Ok(VariantReport {
         label: label.to_string(),
@@ -462,16 +487,7 @@ where
         let results = knn(query, k)?;
         total_time += start.elapsed();
         let truth_row = &truth[idx];
-        let mut expected = Vec::with_capacity(k);
-        for &neighbor in truth_row {
-            if neighbor < available_rows as u32 {
-                expected.push(neighbor);
-            }
-            if expected.len() == k {
-                break;
-            }
-        }
-        let expected: HashSet<u32> = expected.into_iter().collect();
+        let expected = build_expected_set(truth_row, k, available_rows);
         total_targets += expected.len();
         for result in results {
             if expected.contains(&(result.row_id as u32)) {
@@ -498,6 +514,88 @@ where
         qps,
         total_time,
     })
+}
+
+fn evaluate_recall_batch<F>(
+    queries: &[Vec<f32>],
+    truth: &[Vec<u32>],
+    k: usize,
+    available_rows: usize,
+    batch_size: usize,
+    mut knn_batch: F,
+) -> Result<EvalStats>
+where
+    F: FnMut(&[Vec<f32>], usize) -> Result<Vec<Vec<VectorSearchResult>>>,
+{
+    ensure!(!queries.is_empty(), "no queries available for evaluation");
+    ensure!(
+        truth.len() >= queries.len(),
+        "ground truth rows ({}) < query count ({})",
+        truth.len(),
+        queries.len()
+    );
+    ensure!(batch_size > 0, "batch_size must be positive");
+    let mut total_hits = 0usize;
+    let mut total_targets = 0usize;
+    let mut total_time = Duration::ZERO;
+
+    let mut idx = 0;
+    while idx < queries.len() {
+        let end = (idx + batch_size).min(queries.len());
+        let chunk = &queries[idx..end];
+        let start = Instant::now();
+        let batch_results = knn_batch(chunk, k)?;
+        total_time += start.elapsed();
+        ensure!(
+            batch_results.len() == chunk.len(),
+            "batch executor returned {} results but {} queries were provided",
+            batch_results.len(),
+            chunk.len()
+        );
+        for (offset, results) in batch_results.into_iter().enumerate() {
+            let truth_row = &truth[idx + offset];
+            let expected = build_expected_set(truth_row, k, available_rows);
+            total_targets += expected.len();
+            for result in results {
+                if expected.contains(&(result.row_id as u32)) {
+                    total_hits += 1;
+                }
+            }
+        }
+        idx = end;
+    }
+
+    let recall = if total_targets == 0 {
+        0.0
+    } else {
+        total_hits as f64 / total_targets as f64
+    };
+    let avg_ms = total_time.as_secs_f64() * 1_000.0 / queries.len() as f64;
+    let qps = if total_time.is_zero() {
+        0.0
+    } else {
+        queries.len() as f64 / total_time.as_secs_f64()
+    };
+
+    Ok(EvalStats {
+        recall,
+        avg_ms,
+        qps,
+        total_time,
+    })
+}
+
+fn build_expected_set(truth_row: &[u32], k: usize, available_rows: usize) -> HashSet<u32> {
+    let mut expected = Vec::with_capacity(k);
+    for &neighbor in truth_row {
+        if neighbor < available_rows as u32 {
+            expected.push(neighbor);
+        }
+        if expected.len() == k {
+            break;
+        }
+    }
+    expected.into_iter().collect()
 }
 
 fn map_vector_result<T>(result: f3_errors::Result<T>) -> Result<T> {

@@ -6,6 +6,7 @@ use fff_format::ToFlatBuffer;
 use fff_ude_wasm::Runtime as WasmRuntime;
 use flatbuffers::{FlatBufferBuilder, WIPOffset};
 use rand::{rngs::StdRng, Rng, SeedableRng};
+use std::cell::RefCell;
 use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 use std::io::Cursor;
@@ -389,6 +390,30 @@ impl VectorIndexRuntime {
             Self::BruteForce(index) => index.knn_l2(query, k),
             Self::Hnsw(index) => index.knn_l2(query, k),
             Self::CustomWasm(index) => index.knn_l2(query, k),
+        }
+    }
+
+    pub fn knn_l2_batch(
+        &self,
+        queries: &[Vec<f32>],
+        k: usize,
+    ) -> Result<Vec<Vec<VectorSearchResult>>> {
+        match self {
+            Self::BruteForce(index) => {
+                let mut out = Vec::with_capacity(queries.len());
+                for query in queries {
+                    out.push(index.knn_l2(query, k)?);
+                }
+                Ok(out)
+            }
+            Self::Hnsw(index) => {
+                let mut out = Vec::with_capacity(queries.len());
+                for query in queries {
+                    out.push(index.knn_l2(query, k)?);
+                }
+                Ok(out)
+            }
+            Self::CustomWasm(index) => index.knn_l2_batch(queries, k),
         }
     }
 }
@@ -1136,6 +1161,7 @@ fn load_f32x4(slice: &[f32]) -> f32x4 {
 pub struct WasmVectorIndex {
     runtime: WasmRuntime,
     metric: VectorDistanceMetric,
+    payload_buffer: RefCell<Vec<u8>>,
 }
 
 impl WasmVectorIndex {
@@ -1153,7 +1179,11 @@ impl WasmVectorIndex {
         runtime
             .call_scalar_function_owned("vector_init_ffi", index_blob)
             .map_err(|e| Error::General(format!("Vector index WASM init failed: {e}")))?;
-        Ok(Self { runtime, metric })
+        Ok(Self {
+            runtime,
+            metric,
+            payload_buffer: RefCell::new(Vec::new()),
+        })
     }
 
     fn knn_l2(&self, query: &[f32], k: usize) -> Result<Vec<VectorSearchResult>> {
@@ -1162,17 +1192,59 @@ impl WasmVectorIndex {
                 "Custom Wasm vector index currently supports only L2 metric".to_string(),
             ));
         }
-        let mut payload = Vec::with_capacity(8 + query.len() * 4);
-        payload.extend_from_slice(&(query.len() as u32).to_le_bytes());
-        payload.extend_from_slice(&(k as u32).to_le_bytes());
-        for value in query {
-            payload.extend_from_slice(&value.to_le_bytes());
-        }
-        let response = self
-            .runtime
-            .call_scalar_function_owned("vector_knn_ffi", &payload)
-            .map_err(|e| Error::General(format!("Vector index WASM query failed: {e}")))?;
+        let response = {
+            let mut payload = self.payload_buffer.borrow_mut();
+            payload.clear();
+            payload.reserve(8 + query.len() * 4);
+            payload.extend_from_slice(&(query.len() as u32).to_le_bytes());
+            payload.extend_from_slice(&(k as u32).to_le_bytes());
+            for value in query {
+                payload.extend_from_slice(&value.to_le_bytes());
+            }
+            self.runtime
+                .call_scalar_function_owned("vector_knn_ffi", &payload)
+                .map_err(|e| Error::General(format!("Vector index WASM query failed: {e}")))?
+        };
         decode_wasm_results(&response)
+    }
+
+    fn knn_l2_batch(&self, queries: &[Vec<f32>], k: usize) -> Result<Vec<Vec<VectorSearchResult>>> {
+        if queries.is_empty() {
+            return Ok(Vec::new());
+        }
+        if self.metric != VectorDistanceMetric::L2 {
+            return Err(Error::General(
+                "Custom Wasm vector index currently supports only L2 metric".to_string(),
+            ));
+        }
+        let dimension = queries[0].len();
+        for (idx, query) in queries.iter().enumerate() {
+            if query.len() != dimension {
+                return Err(Error::General(format!(
+                    "Query {} dimension {} does not match HNSW index dimension {}",
+                    idx,
+                    query.len(),
+                    dimension
+                )));
+            }
+        }
+        let response = {
+            let mut payload = self.payload_buffer.borrow_mut();
+            payload.clear();
+            payload.reserve(12 + queries.len() * dimension * 4);
+            payload.extend_from_slice(&(dimension as u32).to_le_bytes());
+            payload.extend_from_slice(&(k as u32).to_le_bytes());
+            payload.extend_from_slice(&(queries.len() as u32).to_le_bytes());
+            for query in queries {
+                for value in query {
+                    payload.extend_from_slice(&value.to_le_bytes());
+                }
+            }
+            self.runtime
+                .call_scalar_function_owned("vector_knn_batch_ffi", &payload)
+                .map_err(|e| Error::General(format!("Vector index WASM batch query failed: {e}")))?
+        };
+        decode_wasm_batch_results(&response, queries.len())
     }
 }
 
@@ -1201,4 +1273,53 @@ fn decode_wasm_results(bytes: &[u8]) -> Result<Vec<VectorSearchResult>> {
         results.push(VectorSearchResult { row_id, distance });
     }
     Ok(results)
+}
+
+fn decode_wasm_batch_results(
+    bytes: &[u8],
+    expected_batches: usize,
+) -> Result<Vec<Vec<VectorSearchResult>>> {
+    if bytes.len() < 4 {
+        return Err(Error::General(
+            "Vector WASM batch response too small to contain batch count".to_string(),
+        ));
+    }
+    let batch_count = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+    if batch_count != expected_batches {
+        return Err(Error::General(format!(
+            "Vector WASM batch response mismatch. expected {} batches, got {}",
+            expected_batches, batch_count
+        )));
+    }
+    let mut offset = 4;
+    let mut all_results = Vec::with_capacity(batch_count);
+    for _ in 0..batch_count {
+        if offset + 4 > bytes.len() {
+            return Err(Error::General(
+                "Vector WASM batch response truncated before result count".to_string(),
+            ));
+        }
+        let count = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += 4;
+        let mut results = Vec::with_capacity(count);
+        for _ in 0..count {
+            if offset + 12 > bytes.len() {
+                return Err(Error::General(
+                    "Vector WASM batch response truncated in result payload".to_string(),
+                ));
+            }
+            let row_id = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+            offset += 8;
+            let distance = f32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+            offset += 4;
+            results.push(VectorSearchResult { row_id, distance });
+        }
+        all_results.push(results);
+    }
+    if offset != bytes.len() {
+        return Err(Error::General(
+            "Vector WASM batch response has trailing bytes".to_string(),
+        ));
+    }
+    Ok(all_results)
 }

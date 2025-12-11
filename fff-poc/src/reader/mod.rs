@@ -157,6 +157,38 @@ impl<R: Reader> FileReaderV2<R> {
             .knn_l2(query, k)
     }
 
+    pub fn vector_knn_l2_batch(
+        &mut self,
+        index_id: u32,
+        queries: &[Vec<f32>],
+        k: usize,
+    ) -> Result<Vec<Vec<VectorSearchResult>>> {
+        if queries.is_empty() {
+            return Ok(Vec::new());
+        }
+        let descriptor = self
+            .vector_indexes
+            .iter()
+            .find(|desc| desc.index_id == index_id)
+            .cloned()
+            .ok_or_else(|| {
+                Error::General(format!("Vector index {} not found in footer", index_id))
+            })?;
+        if !self.vector_runtime_cache.contains_key(&index_id) {
+            let blob = self.load_vector_index_blob(index_id)?.ok_or_else(|| {
+                Error::General(format!("Vector index blob {} is missing", index_id))
+            })?;
+            let wasm_blob = self.load_vector_index_wasm(index_id)?;
+            let runtime =
+                VectorIndexRuntime::from_descriptor(&descriptor, &blob, wasm_blob.as_deref())?;
+            self.vector_runtime_cache.insert(index_id, runtime);
+        }
+        self.vector_runtime_cache
+            .get(&index_id)
+            .unwrap()
+            .knn_l2_batch(queries, k)
+    }
+
     pub fn read_file(&mut self) -> Result<Vec<RecordBatch>> {
         let footer = Footer::try_new_with_projection(
             &self.row_group_cnt_n_pointers,

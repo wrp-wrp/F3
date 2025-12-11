@@ -8,7 +8,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 DATA_DIR="${DATA_DIR:-${REPO_ROOT}/data/sift1m}"
 TRAIN_SIZE="${TRAIN_SIZE:-20000}"
-QUERY_SIZE="${QUERY_SIZE:-100}"
+QUERY_SIZE="${QUERY_SIZE:-10000}"
 K="${K:-5}"
 ALGORITHM="${ALGORITHM:-wasm}"
 HNSW_M="${HNSW_M:-48}"
@@ -17,6 +17,8 @@ OUTPUT_BLOB="${OUTPUT_BLOB:-}"
 OUTPUT_FILE="${OUTPUT_FILE:-}"
 COMPARE_NATIVE="${COMPARE_NATIVE:-1}"
 WASM_MODULE="${WASM_MODULE:-${REPO_ROOT}/target/wasm32-wasip1/release/vector_hnsw_wasm.wasm}"
+WASM_BATCH_SIZE="${WASM_BATCH_SIZE:-1}"
+PIPELINE_EXAMPLE="${PIPELINE_EXAMPLE:-vector_sift_pipeline}"
 ARCHIVE_URL="${ARCHIVE_URL:-ftp://ftp.irisa.fr/local/texmex/corpus/sift.tar.gz}"
 
 mkdir -p "${DATA_DIR}"
@@ -54,7 +56,7 @@ if [[ "${ALGORITHM}" == "wasm" ]]; then
   fi
 fi
 
-CMD=(cargo run --release -p fff-poc --example vector_sift_pipeline -- --dataset-dir "${DATA_DIR}" --train-size "${TRAIN_SIZE}" --query-size "${QUERY_SIZE}" --k "${K}" --algorithm "${ALGORITHM}" --hnsw-m "${HNSW_M}" --hnsw-ef-search "${HNSW_EF_SEARCH}")
+CMD=(cargo run --release -p fff-poc --example "${PIPELINE_EXAMPLE}" -- --dataset-dir "${DATA_DIR}" --train-size "${TRAIN_SIZE}" --query-size "${QUERY_SIZE}" --k "${K}" --algorithm "${ALGORITHM}" --hnsw-m "${HNSW_M}" --hnsw-ef-search "${HNSW_EF_SEARCH}")
 
 if [[ -n "${OUTPUT_BLOB}" ]]; then
   CMD+=(--output-blob "${OUTPUT_BLOB}")
@@ -62,6 +64,7 @@ fi
 
 if [[ "${ALGORITHM}" == "wasm" ]]; then
   CMD+=(--wasm-module "${WASM_MODULE}")
+  CMD+=(--wasm-batch-size "${WASM_BATCH_SIZE}")
   if [[ "${COMPARE_NATIVE}" == "1" ]]; then
     CMD+=(--compare-native)
   fi

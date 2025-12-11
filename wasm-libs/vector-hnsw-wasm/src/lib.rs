@@ -53,6 +53,55 @@ fn vector_knn(input: &[u8]) -> Result<Box<[u8]>> {
     Ok(buffer.into_boxed_slice())
 }
 
+fn vector_knn_batch(input: &[u8]) -> Result<Box<[u8]>> {
+    if input.len() < 12 {
+        return Err(Error::General(
+            "vector knn batch payload must contain dimension, k, and batch size".to_string(),
+        ));
+    }
+    let dimension = u32::from_le_bytes(input[0..4].try_into().unwrap()) as usize;
+    let k = u32::from_le_bytes(input[4..8].try_into().unwrap()) as usize;
+    let batch_size = u32::from_le_bytes(input[8..12].try_into().unwrap()) as usize;
+    let expected = 12
+        + dimension
+            .checked_mul(batch_size)
+            .ok_or_else(|| {
+                Error::General("vector knn batch payload dimension overflow".to_string())
+            })?
+            .checked_mul(4)
+            .ok_or_else(|| {
+                Error::General("vector knn batch payload dimension overflow".to_string())
+            })?;
+    if input.len() != expected {
+        return Err(Error::General(format!(
+            "vector knn batch payload dimension mismatch. expected {} bytes, got {}",
+            expected,
+            input.len()
+        )));
+    }
+    let index = INDEX
+        .get()
+        .ok_or_else(|| Error::General("HNSW index not initialized".to_string()))?;
+    let mut cursor = Cursor::new(&input[12..]);
+    let mut query = vec![0f32; dimension];
+    let mut buffer = Vec::with_capacity(4 + batch_size * (4 + k * (8 + 4)));
+    buffer.extend_from_slice(&(batch_size as u32).to_le_bytes());
+    for _ in 0..batch_size {
+        for value in query.iter_mut() {
+            *value = cursor
+                .read_f32::<LittleEndian>()
+                .map_err(|e| Error::General(format!("Unable to read query value: {e}")))?;
+        }
+        let results = index.knn_l2(&query, k)?;
+        buffer.extend_from_slice(&(results.len() as u32).to_le_bytes());
+        for res in results {
+            buffer.extend_from_slice(&(res.row_id as u64).to_le_bytes());
+            buffer.extend_from_slice(&res.distance.to_le_bytes());
+        }
+    }
+    Ok(buffer.into_boxed_slice())
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn vector_init_ffi(
     ptr: *const u8,
@@ -69,6 +118,15 @@ pub unsafe extern "C" fn vector_knn_ffi(
     out: *mut fff_ude::ffi::CSlice,
 ) -> i32 {
     scalar_wrapper(vector_knn, ptr, len, out)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vector_knn_batch_ffi(
+    ptr: *const u8,
+    len: usize,
+    out: *mut fff_ude::ffi::CSlice,
+) -> i32 {
+    scalar_wrapper(vector_knn_batch, ptr, len, out)
 }
 
 #[derive(Clone, Debug)]

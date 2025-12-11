@@ -216,6 +216,21 @@ fn vector_index_hnsw_roundtrip_and_search() {
             );
         }
     }
+
+    let batch_queries: Vec<Vec<f32>> = vec![[0.9_f32, 0.1_f32], [0.05, 0.05], [0.8, 0.8]]
+        .into_iter()
+        .map(|arr| arr.to_vec())
+        .collect();
+    let batch_results = reader.vector_knn_l2_batch(11, &batch_queries, 3).unwrap();
+    assert_eq!(batch_results.len(), batch_queries.len());
+    for (idx, results) in batch_results.iter().enumerate() {
+        let expected = brute_force_knn(&source_vectors, &batch_queries[idx], 3);
+        assert_eq!(results.len(), expected.len());
+        for (res, exp) in results.iter().zip(expected.iter()) {
+            assert_eq!(res.row_id, exp.0 as u64);
+            assert!((res.distance - exp.1).abs() < 1e-6);
+        }
+    }
 }
 
 fn brute_force_knn(vectors: &[Vec<f32>], query: &[f32], k: usize) -> Vec<(usize, f32)> {

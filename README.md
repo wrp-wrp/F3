@@ -78,7 +78,22 @@ The tree above highlights the crates and directories you will touch most often w
    ```
    Some commands expect local copies of the datasets referenced in `fff-bench::bench_data`; see `fff-bench/examples/README.md` and `doc/paper_reproduction.md` for dataset download instructions.
 
-4. **Debug & develop**  
+4. **Vector recall measurements on SIFT**  
+   Use the helper script below to download the SIFT1M vectors, build an in-file ANN index, and report recall/latency metrics using the `vector_sift_pipeline` example. By default it compiles the `wasm-libs/vector-hnsw-wasm` module, embeds it alongside the index, and runs queries through the embedded Wasm runtime:
+   ```shell
+   ./exp_scripts/vector_sift_pipeline.sh
+   ```
+   The script fetches the TexMex SIFT archive (≈1.5 GB), unpacks it under `data/sift1m/`, compiles the Wasm module for `wasm32-wasip1`, and runs the pipeline with 100k base vectors / 1k queries by default. Override its behavior with env vars, e.g.:
+   ```shell
+   TRAIN_SIZE=500000 QUERY_SIZE=10000 K=20 \
+     ALGORITHM=wasm HNSW_M=48 HNSW_EF_SEARCH=128 \
+     WASM_MODULE=$PWD/wasm-libs/vector-hnsw-wasm/target/wasm32-wasip1/release/vector_hnsw_wasm.wasm \
+     OUTPUT_FILE=/tmp/sift-vector-index.f3 \
+     ./exp_scripts/vector_sift_pipeline.sh
+   ```
+   For brute-force baselines set `ALGORITHM=brute`. Set `ALGORITHM=hnsw` to call the native Rust runtime instead of Wasm. The pipeline also accepts `OUTPUT_BLOB=/tmp/sift_hnsw.bin` to persist the raw index blob for future file writers.
+
+5. **Debug & develop**  
    - Modify encoding logic in `fff-encoding/` or Wasm adapters under `fff-ude-wasm/wasm/*.rs`, then rerun the `fff-poc` tests.
    - Use `cargo test -p fff-bench -- --ignored` to exercise benchmarks marked as ignored by default.
    - The helper scripts in `scripts/` and `exp_scripts/` automate collecting statistics for the paper; inspect them when reproducing published figures.

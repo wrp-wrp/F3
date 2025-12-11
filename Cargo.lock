@@ -3139,6 +3139,7 @@ dependencies = [
 name = "fff-poc"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "arrow",
  "arrow-array 53.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "arrow-buffer 53.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -3185,6 +3186,7 @@ dependencies = [
  "vortex-ipc",
  "vortex-sampling-compressor",
  "wasm-test-encoders",
+ "wide",
  "xxhash-rust",
  "zstd",
 ]
@@ -6397,6 +6399,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f3cb5ba0dc43242ce17de99c180e96db90b235b8a9fdc9543c96d2209116bd9f"
 
 [[package]]
+name = "safe_arch"
+version = "0.7.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "96b02de82ddbe1b636e6170c21be622223aea188ef2e139be0a5b219ec215323"
+dependencies = [
+ "bytemuck",
+]
+
+[[package]]
 name = "same-file"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7575,6 +7586,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
+name = "vector-hnsw-wasm"
+version = "0.1.0"
+dependencies = [
+ "byteorder",
+ "fff-core",
+ "fff-ude",
+ "wide",
+]
+
+[[package]]
 name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8719,6 +8740,16 @@ dependencies = [
  "libc",
  "memory_units",
  "winapi",
+]
+
+[[package]]
+name = "wide"
+version = "0.7.33"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0ce5da8ecb62bcd8ec8b7ea19f69a51275e91299be594ea5cc6ef7819e16cd03"
+dependencies = [
+ "bytemuck",
+ "safe_arch",
 ]
 
 [[package]]

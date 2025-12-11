@@ -32,6 +32,7 @@ members = [
     "wasm-libs/test-size",
     "wasm-libs/test-wmemcheck",
     "wasm-libs/adv-ude-fff",
+    "wasm-libs/vector-hnsw-wasm",
 ]
 resolver = "2"
 
@@ -103,6 +104,7 @@ snafu = "0.8.5"
 criterion = { version = "0.5.1", features = ["html_reports"] }
 lazy_static = "1.4.0"
 byteorder = "1.5.0"
+wide = "0.7.18"
 
 # vortex 
 vortex-error = { git = "https://github.com/XinyuZeng/vortex.git", rev = "c0d89a66cbaa542bd9aa277cfdf52f2728c4b37a" }

@@ -20,6 +20,7 @@ use fff_core::{
 };
 use fff_format::File::fff::flatbuf::{self as fb, CompressionType};
 use fff_format::{MAGIC, POSTSCRIPT_SIZE};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 mod projection;
@@ -97,6 +98,7 @@ pub struct FileReaderV2<R> {
     /// Whether we verify the IOUnit checksum.
     checksum_type: Option<ChecksumType>,
     vector_indexes: Vec<VectorIndexDescriptor>,
+    vector_runtime_cache: HashMap<u32, VectorIndexRuntime>,
 }
 
 impl<R: Reader> FileReaderV2<R> {
@@ -140,11 +142,19 @@ impl<R: Reader> FileReaderV2<R> {
             .ok_or_else(|| {
                 Error::General(format!("Vector index {} not found in footer", index_id))
             })?;
-        let blob = self
-            .load_vector_index_blob(index_id)?
-            .ok_or_else(|| Error::General(format!("Vector index blob {} is missing", index_id)))?;
-        let runtime = VectorIndexRuntime::from_descriptor(&descriptor, &blob)?;
-        runtime.knn_l2(query, k)
+        if !self.vector_runtime_cache.contains_key(&index_id) {
+            let blob = self.load_vector_index_blob(index_id)?.ok_or_else(|| {
+                Error::General(format!("Vector index blob {} is missing", index_id))
+            })?;
+            let wasm_blob = self.load_vector_index_wasm(index_id)?;
+            let runtime =
+                VectorIndexRuntime::from_descriptor(&descriptor, &blob, wasm_blob.as_deref())?;
+            self.vector_runtime_cache.insert(index_id, runtime);
+        }
+        self.vector_runtime_cache
+            .get(&index_id)
+            .unwrap()
+            .knn_l2(query, k)
     }
 
     pub fn read_file(&mut self) -> Result<Vec<RecordBatch>> {

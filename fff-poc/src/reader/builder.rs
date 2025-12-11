@@ -294,6 +294,7 @@ impl<R: Reader + Clone> FileReaderV2Builder<R> {
                 .verify_io_unit_checksum
                 .then_some(post_script.checksum_type),
             vector_indexes,
+            vector_runtime_cache: HashMap::new(),
         })
     }
 }

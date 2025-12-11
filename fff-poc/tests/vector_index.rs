@@ -6,8 +6,8 @@ use fff_poc::{
     options::FileWriterOptions,
     reader::FileReaderV2Builder,
     vector_index::{
-        encode_bruteforce_index, QuantizationMethod, QuantizationSegment, QuantizationSpec,
-        VectorDistanceMetric, VectorIndexAlgorithm, VectorIndexConfig,
+        encode_bruteforce_index, encode_hnsw_index, QuantizationMethod, QuantizationSegment,
+        QuantizationSpec, VectorDistanceMetric, VectorIndexAlgorithm, VectorIndexConfig,
     },
     writer::FileWriter,
 };
@@ -97,6 +97,105 @@ fn vector_index_metadata_roundtrip() {
     let queries = vec![[0.9_f32, 0.1_f32], [0.05, 0.05], [0.95, 0.1], [0.25, 0.85]];
     for query in queries {
         let actual = reader.vector_knn_l2(7, &query, 3).unwrap();
+        let expected = brute_force_knn(&source_vectors, &query, 3);
+        assert_eq!(
+            actual.len(),
+            expected.len(),
+            "result length mismatch for query {:?}",
+            query
+        );
+        for (res, exp) in actual.iter().zip(expected.iter()) {
+            assert_eq!(
+                res.row_id, exp.0 as u64,
+                "row id mismatch for query {:?}",
+                query
+            );
+            assert!(
+                (res.distance - exp.1).abs() < 1e-6,
+                "distance mismatch for query {:?}",
+                query
+            );
+        }
+    }
+}
+
+#[test]
+fn vector_index_hnsw_roundtrip_and_search() {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "values",
+        DataType::Int32,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![10, 20, 30, 40]))],
+    )
+    .unwrap();
+
+    let source_vectors = vec![
+        vec![0.0, 0.0],
+        vec![1.0, 0.0],
+        vec![0.0, 1.0],
+        vec![1.0, 1.0],
+        vec![0.5, 0.5],
+        vec![0.2, 0.9],
+        vec![0.9, 0.2],
+        vec![0.3, 0.3],
+        vec![0.8, 0.75],
+        vec![0.15, 0.2],
+    ];
+    let vector_data = encode_hnsw_index(
+        &source_vectors,
+        source_vectors.len() - 1,
+        source_vectors.len(),
+    )
+    .unwrap();
+
+    let vector_config = VectorIndexConfig {
+        index_id: 11,
+        column: "values".to_string(),
+        algorithm: VectorIndexAlgorithm::Hnsw,
+        distance_metric: VectorDistanceMetric::L2,
+        priority: 1,
+        usage_hint: Some("hnsw-test".to_string()),
+        quantization: QuantizationSpec {
+            dimension: 2,
+            segments: vec![QuantizationSegment {
+                start_dim: 0,
+                end_dim: 2,
+                method: QuantizationMethod::None,
+                bits: 0,
+                params: vec![],
+            }],
+        },
+        custom_params: vec![],
+        data: vector_data.clone(),
+        wasm_module: None,
+    };
+
+    let options = FileWriterOptions::builder()
+        .add_vector_index(vector_config)
+        .build();
+
+    let temp_file = Arc::new(tempfile::tempfile().unwrap());
+    let mut writer = FileWriter::try_new(schema.clone(), temp_file.clone(), options).unwrap();
+    writer.write_batch(&batch).unwrap();
+    writer.finish().unwrap();
+
+    let mut reader = FileReaderV2Builder::new(temp_file.clone()).build().unwrap();
+    let indexes = reader.vector_indexes();
+    assert_eq!(indexes.len(), 1);
+    assert_eq!(indexes[0].algorithm, VectorIndexAlgorithm::Hnsw);
+
+    let data_blob = reader
+        .load_vector_index_blob(11)
+        .unwrap()
+        .expect("vector blob present");
+    assert_eq!(data_blob, vector_data);
+
+    let queries = vec![[0.9_f32, 0.1_f32], [0.05, 0.05], [0.8, 0.8], [0.25, 0.85]];
+    for query in queries {
+        let actual = reader.vector_knn_l2(11, &query, 3).unwrap();
         let expected = brute_force_knn(&source_vectors, &query, 3);
         assert_eq!(
             actual.len(),

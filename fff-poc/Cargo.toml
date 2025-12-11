@@ -46,6 +46,7 @@ libloading = "0.8"
 uniffi_core.workspace = true
 rand = { workspace = true }
 itertools = "0.13.0"
+wide = { workspace = true }
 
 [dev-dependencies]
 bench-vortex = { workspace = true }
@@ -67,6 +68,7 @@ itertools = "0.13.0"
 rstest = "0.23.0"
 rstest_reuse = "0.7.0"
 wasm-test-encoders.workspace = true
+anyhow = "1.0"
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 mimalloc = { workspace = true }

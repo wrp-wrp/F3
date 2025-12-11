@@ -331,6 +331,39 @@ impl Runtime {
         // })
     }
 
+    /// Call a scalar function and return an owned Vec<u8> while reclaiming guest memory.
+    pub fn call_scalar_function_owned(&self, name: &str, input: &[u8]) -> Result<Vec<u8>> {
+        if !self.functions.contains(name) {
+            bail!("function not found: {name}");
+        }
+        let instance = if let Some(instance) = self.instances.lock().unwrap().pop_front() {
+            instance
+        } else {
+            Arc::new(Mutex::new(Instance::new(self)?))
+        };
+        {
+            let mut guard = instance.lock().unwrap();
+            if let Ok((slice, ptr)) = guard.call_scalar_function(name, input) {
+                let vec = slice.to_vec();
+                guard.release_scalar_output(ptr, vec.len())?;
+                drop(guard);
+                self.instances.lock().unwrap().push_back(instance);
+                return Ok(vec);
+            }
+        }
+        drop(instance);
+
+        // Retry with a fresh instance to recover from traps.
+        let fresh_instance = Arc::new(Mutex::new(Instance::new(self)?));
+        let mut guard = fresh_instance.lock().unwrap();
+        let (slice, ptr) = guard.call_scalar_function(name, input)?;
+        let vec = slice.to_vec();
+        guard.release_scalar_output(ptr, vec.len())?;
+        drop(guard);
+        self.instances.lock().unwrap().push_back(fresh_instance);
+        Ok(vec)
+    }
+
     /// Call a function that returns a Buffer Iterator.
     pub fn call_multi_buf(&self, name: &str, input: &[u8]) -> Result<impl Iterator<Item = Buffer>> {
         if !self.functions.contains(name) {
@@ -666,6 +699,15 @@ impl Instance {
         };
         // Return both the host-accessible slice and the WASM pointer.
         result.map(|o| (o, out_ptr))
+    }
+
+    fn release_scalar_output(&mut self, ptr: u32, len: usize) -> Result<()> {
+        if ptr == 0 || len == 0 {
+            return Ok(());
+        }
+        let len = u32::try_from(len).context("scalar output length exceeds 4GiB")?;
+        self.dealloc.call(&mut self.store, (ptr, len, 1))?;
+        Ok(())
     }
 
     /// Call a generic function that returns an iterator of Buffers. Those buffers together form an Arrow Array.

@@ -1,0 +1,13 @@
+[package]
+name = "vector-hnsw-wasm"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+fff-ude = { path = "../../fff-ude" }
+fff-core = { path = "../../fff-core" }
+byteorder = { workspace = true }
+wide = { workspace = true }

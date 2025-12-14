@@ -5,7 +5,7 @@ use crate::dict::shared_dictionary_cache::SharedDictionaryCache;
 use crate::io::reader::Reader;
 use crate::{common::ColumnIndexSequence, context::WASMReadingContext};
 use arrow::array::AsArray;
-use arrow_array::{Array, ArrayRef, LargeListArray, ListArray, StructArray};
+use arrow_array::{Array, ArrayRef, FixedSizeListArray, LargeListArray, ListArray, StructArray};
 use arrow_buffer::{NullBuffer, OffsetBuffer, OffsetBufferBuilder, ScalarBuffer};
 use arrow_schema::{DataType, Field, FieldRef, Fields};
 use bytes::BytesMut;
@@ -171,6 +171,69 @@ pub struct ListColDecoder<'a, R> {
     field: FieldRef,
     validity_offsets_decoder: PrimitiveColDecoder<'a, R>,
     values_decoder: Box<dyn LogicalColDecoder + 'a>,
+}
+
+pub struct FixedSizeListColDecoder<'a, R> {
+    field: FieldRef,
+    list_size: i32,
+    validity_decoder: PrimitiveColDecoder<'a, R>,
+    values_decoder: PrimitiveColDecoder<'a, R>,
+}
+
+impl<R: Reader> LogicalColDecoder for FixedSizeListColDecoder<'_, R> {
+    fn decode_batch(&mut self) -> Result<Vec<ArrayRef>> {
+        let mut res = vec![];
+        let validity = self.validity_decoder.decode_batch()?;
+        let values = self.values_decoder.decode_batch()?;
+        if validity.len() != values.len() {
+            return Err(Error::General(
+                "FixedSizeList decode: validity/values page count mismatch".to_string(),
+            ));
+        }
+        for (v, val) in validity.into_iter().zip(values.into_iter()) {
+            let bool_array = v.as_boolean();
+            let nulls =
+                (!bool_array.is_empty()).then(|| NullBuffer::new(bool_array.values().clone()));
+            res.push(Arc::new(FixedSizeListArray::new(
+                match self.field.data_type() {
+                    DataType::FixedSizeList(item, _) => item.clone(),
+                    _ => unreachable!(),
+                },
+                self.list_size,
+                val,
+                nulls,
+            )) as ArrayRef);
+        }
+        Ok(res)
+    }
+
+    fn decode_row_at(&mut self, row_id: usize, len: usize) -> Result<Vec<ArrayRef>> {
+        let mut res = vec![];
+        let validity = self.validity_decoder.decode_row_at(row_id, len)?;
+        let values = self
+            .values_decoder
+            .decode_row_at(row_id * (self.list_size as usize), len * (self.list_size as usize))?;
+        if validity.len() != values.len() {
+            return Err(Error::General(
+                "FixedSizeList decode_row_at: validity/values page count mismatch".to_string(),
+            ));
+        }
+        for (v, val) in validity.into_iter().zip(values.into_iter()) {
+            let bool_array = v.as_boolean();
+            let nulls =
+                (!bool_array.is_empty()).then(|| NullBuffer::new(bool_array.values().clone()));
+            res.push(Arc::new(FixedSizeListArray::new(
+                match self.field.data_type() {
+                    DataType::FixedSizeList(item, _) => item.clone(),
+                    _ => unreachable!(),
+                },
+                self.list_size,
+                val,
+                nulls,
+            )) as ArrayRef);
+        }
+        Ok(res)
+    }
 }
 
 impl<R: Reader> LogicalColDecoder for ListColDecoder<'_, R> {
@@ -603,15 +666,15 @@ pub fn create_logical_decoder<'a, R: Reader>(
     //     }
     //     _ => (),
     // }
-    let column_index = column_idx.next_column_index();
-    let column_meta = column_metas.get(column_index as usize).unwrap();
-    let chunks_meta_iter = column_meta
-        .column_chunks()
-        .ok_or_else(|| Error::General("No chunks in column meta".to_string()))?
-        .iter();
     match field.data_type() {
         non_nest_types!() => {
             let data_type = field.data_type().clone();
+            let column_index = column_idx.next_column_index();
+            let column_meta = column_metas.get(column_index as usize).unwrap();
+            let chunks_meta_iter = column_meta
+                .column_chunks()
+                .ok_or_else(|| Error::General("No chunks in column meta".to_string()))?
+                .iter();
             Ok(Box::new(PrimitiveColDecoder {
                 r,
                 chunk_decoder: None,
@@ -622,7 +685,53 @@ pub fn create_logical_decoder<'a, R: Reader>(
                 checksum_type,
             }))
         }
+        DataType::FixedSizeList(child, list_size)
+            if matches!(child.data_type(), non_nest_types!()) =>
+        {
+            let validity_index = column_idx.next_column_index();
+            let validity_meta = column_metas.get(validity_index as usize).unwrap();
+            let validity_iter = validity_meta
+                .column_chunks()
+                .ok_or_else(|| Error::General("No chunks in column meta".to_string()))?
+                .iter();
+
+            let values_index = column_idx.next_column_index();
+            let values_meta = column_metas.get(values_index as usize).unwrap();
+            let values_iter = values_meta
+                .column_chunks()
+                .ok_or_else(|| Error::General("No chunks in column meta".to_string()))?
+                .iter();
+
+            Ok(Box::new(FixedSizeListColDecoder {
+                field: Arc::clone(&field),
+                list_size: *list_size,
+                validity_decoder: PrimitiveColDecoder {
+                    r,
+                    chunk_decoder: None,
+                    chunks_meta_iter: validity_iter,
+                    primitive_type: DataType::Boolean,
+                    wasm_context: wasm_context.as_ref().map(Arc::clone),
+                    shared_dictionary_cache,
+                    checksum_type,
+                },
+                values_decoder: PrimitiveColDecoder {
+                    r,
+                    chunk_decoder: None,
+                    chunks_meta_iter: values_iter,
+                    primitive_type: child.data_type().clone(),
+                    wasm_context: wasm_context.as_ref().map(Arc::clone),
+                    shared_dictionary_cache,
+                    checksum_type,
+                },
+            }))
+        }
         DataType::List(child) | DataType::LargeList(child) => {
+            let column_index = column_idx.next_column_index();
+            let column_meta = column_metas.get(column_index as usize).unwrap();
+            let chunks_meta_iter = column_meta
+                .column_chunks()
+                .ok_or_else(|| Error::General("No chunks in column meta".to_string()))?
+                .iter();
             Ok(Box::new(ListColDecoder {
                 field: Arc::clone(&field),
                 validity_offsets_decoder: PrimitiveColDecoder {
@@ -646,33 +755,41 @@ pub fn create_logical_decoder<'a, R: Reader>(
                 )?,
             }))
         }
-        DataType::Struct(child_fields) => Ok(Box::new(StructColDecoder {
-            fields: child_fields.clone(),
-            // validity decoder for struct is a primitive decoder for Boolean
-            validity_decoder: PrimitiveColDecoder {
-                r,
-                chunk_decoder: None,
-                chunks_meta_iter,
-                primitive_type: DataType::Boolean,
-                wasm_context: wasm_context.as_ref().map(Arc::clone),
-                shared_dictionary_cache,
-                checksum_type,
-            },
-            children: child_fields
-                .iter()
-                .map(|f| {
-                    create_logical_decoder(
-                        r,
-                        Arc::clone(f),
-                        column_metas,
-                        column_idx,
-                        wasm_context.as_ref().map(Arc::clone),
-                        shared_dictionary_cache,
-                        checksum_type,
-                    )
-                })
-                .collect::<Result<Vec<_>>>()?,
-        })),
+        DataType::Struct(child_fields) => {
+            let column_index = column_idx.next_column_index();
+            let column_meta = column_metas.get(column_index as usize).unwrap();
+            let chunks_meta_iter = column_meta
+                .column_chunks()
+                .ok_or_else(|| Error::General("No chunks in column meta".to_string()))?
+                .iter();
+            Ok(Box::new(StructColDecoder {
+                fields: child_fields.clone(),
+                // validity decoder for struct is a primitive decoder for Boolean
+                validity_decoder: PrimitiveColDecoder {
+                    r,
+                    chunk_decoder: None,
+                    chunks_meta_iter,
+                    primitive_type: DataType::Boolean,
+                    wasm_context: wasm_context.as_ref().map(Arc::clone),
+                    shared_dictionary_cache,
+                    checksum_type,
+                },
+                children: child_fields
+                    .iter()
+                    .map(|f| {
+                        create_logical_decoder(
+                            r,
+                            Arc::clone(f),
+                            column_metas,
+                            column_idx,
+                            wasm_context.as_ref().map(Arc::clone),
+                            shared_dictionary_cache,
+                            checksum_type,
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            }))
+        }
         _ => todo!("Implement logical encoding for field {}", field),
     }
 }
@@ -681,6 +798,11 @@ pub fn advance_column_index(field: FieldRef, column_idx: &mut ColumnIndexSequenc
     match field.data_type() {
         non_nest_types!() => {
             let _column_index = column_idx.next_column_index();
+            Ok(())
+        }
+        DataType::FixedSizeList(child, _list_size) if matches!(child.data_type(), non_nest_types!()) => {
+            let _validity = column_idx.next_column_index();
+            let _values = column_idx.next_column_index();
             Ok(())
         }
         DataType::List(_child) | DataType::LargeList(_child) => {

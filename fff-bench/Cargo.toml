@@ -68,6 +68,7 @@ bytes = { workspace = true }
 fff-encoding = { path = "../fff-encoding" }
 fff-test-util = { path = "../fff-test-util" }
 fff-ude-wasm = { path = "../fff-ude-wasm" }
+fff-vindex = { path = "../fff-vindex" }
 uuid = "1.8.0"
 
 [dev-dependencies]

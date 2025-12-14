@@ -1,4 +1,4 @@
-use arrow_array::{Int32Array, RecordBatch};
+use arrow_array::{FixedSizeListArray, Float32Array, Int32Array, RecordBatch};
 use arrow_ipc::writer::{DictionaryTracker, IpcDataGenerator, IpcWriteOptions};
 use arrow_schema::{DataType, Field, Schema};
 use fff_format::{File::fff::flatbuf::CompressionType, MAJOR_VERSION, MINOR_VERSION};
@@ -131,4 +131,85 @@ fn test_version_incompatibility() {
     let file = std::fs::File::open(path).unwrap();
     let mut reader = FileReaderV2Builder::new(Arc::new(file)).build().unwrap();
     let _output_batches = reader.read_file().unwrap();
+}
+
+#[test]
+fn test_selection_multiple_row_indexes_preserve_order() {
+    let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
+    let a = Int32Array::from((0..10).collect::<Vec<_>>());
+    let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(a)]).unwrap();
+
+    let mut file = tempfile::tempfile().unwrap();
+    {
+        let mut writer =
+            FileWriter::try_new(batch.schema(), &file, FileWriterOptions::default()).unwrap();
+        writer.write_batch(&batch).unwrap();
+        writer.finish().unwrap();
+    }
+
+    file.rewind().unwrap();
+    let mut reader = FileReaderV2Builder::new(Arc::new(file))
+        .with_selection(Selection::RowIndexes(vec![3, 1, 4]))
+        .build()
+        .unwrap();
+    let batches = reader.read_file().unwrap();
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].num_rows(), 3);
+    let col = batches[0].column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+    assert_eq!(col.values(), &[3, 1, 4]);
+}
+
+#[test]
+fn test_fixed_size_list_roundtrip_and_selection() {
+    let dim = 2i32;
+    let item_field = Arc::new(Field::new("item", DataType::Float32, false));
+    let vec_field = Field::new(
+        "v",
+        DataType::FixedSizeList(Arc::clone(&item_field), dim),
+        false,
+    );
+    let schema = Arc::new(Schema::new(vec![vec_field]));
+
+    // 4 rows, dim=2
+    let values = Float32Array::from(vec![0.0, 0.1, 1.0, 1.1, 2.0, 2.1, 3.0, 3.1]);
+    let fsl = FixedSizeListArray::try_new(
+        item_field,
+        dim,
+        Arc::new(values),
+        None,
+    )
+    .unwrap();
+
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(fsl)]).unwrap();
+    let mut file = tempfile::tempfile().unwrap();
+    {
+        let mut writer =
+            FileWriter::try_new(batch.schema(), &file, FileWriterOptions::default()).unwrap();
+        writer.write_batch(&batch).unwrap();
+        writer.finish().unwrap();
+    }
+
+    file.rewind().unwrap();
+    let mut reader = FileReaderV2Builder::new(Arc::new(file))
+        .with_selection(Selection::RowIndexes(vec![2, 0]))
+        .build()
+        .unwrap();
+    let batches = reader.read_file().unwrap();
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].num_rows(), 2);
+
+    let out = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<FixedSizeListArray>()
+        .unwrap();
+    assert_eq!(out.value_length(), dim);
+    let out_values = out
+        .values()
+        .as_any()
+        .downcast_ref::<Float32Array>()
+        .unwrap()
+        .values();
+    // rows [2,0] => [2.0,2.1, 0.0,0.1]
+    assert_eq!(out_values, &[2.0, 2.1, 0.0, 0.1]);
 }

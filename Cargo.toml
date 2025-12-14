@@ -9,6 +9,7 @@ members = [
     "fff-poc",
     "fff-test-util",
     "fff-ude",
+    "fff-vindex",
     "wasm-libs/wasm-test-encoders",
     "wasm-libs/fff-ude-example",
     "wasm-libs/fff-ude-example-noop",

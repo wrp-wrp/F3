@@ -1,4 +1,5 @@
 #![feature(new_range_api)]
+#[cfg(not(target_vendor = "apple"))]
 use mimalloc::MiMalloc;
 
 pub mod common;
@@ -14,6 +15,8 @@ pub mod context;
 pub mod decoder;
 mod dict;
 pub(crate) mod encoder;
-
+// NOTE: `mimalloc` can fail to link on Apple targets in some toolchain / deployment-target
+// combinations (e.g. missing `___emutls_get_address`). We keep the system allocator on Apple.
+#[cfg(not(target_vendor = "apple"))]
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;

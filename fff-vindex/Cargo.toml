@@ -1,0 +1,21 @@
+[package]
+name = "fff-vindex"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = "1.0"
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+arrow = { workspace = true }
+rand = { workspace = true }
+byteorder = { workspace = true }
+ordered-float = "4.5.0"
+
+fff-poc = { path = "../fff-poc" }
+fff-format = { path = "../fff-format" }
+
+[dev-dependencies]
+tempfile = { workspace = true }

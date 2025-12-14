@@ -10,6 +10,7 @@ use crate::{
 use arrow::compute::concat;
 use arrow_array::RecordBatch;
 use arrow_buffer::MutableBuffer;
+use arrow_array::UInt32Array;
 use arrow_schema::{DataType, Field, FieldRef, Schema, SchemaRef};
 use byteorder::{ByteOrder, LittleEndian};
 use bytes::Bytes;
@@ -219,12 +220,48 @@ fn read_file_based_on_footer<R: Reader>(
                 shared_dictionary_cache,
                 checksum_type,
             )?;
-            let arrays = if let Selection::RowIndexes(row_indexes) = &selection_in_rg {
-                col_decoder.decode_row_at(row_indexes[0] as usize, 1)?
-            } else {
-                col_decoder.decode_batch()?
-            };
-            columns.push(arrays);
+            match &selection_in_rg {
+                Selection::All => {
+                    let arrays = col_decoder.decode_batch()?;
+                    columns.push(arrays);
+                }
+                Selection::RowIndexes(row_indexes) => {
+                    if row_indexes.is_empty() {
+                        return Err(Error::General("Empty row indexes".to_string()));
+                    }
+
+                    // Decode a single contiguous span [min, max] once. This is required because
+                    // current column decoders consume chunk iterators and cannot be rewound.
+                    let mut min_idx = row_indexes[0];
+                    let mut max_idx = row_indexes[0];
+                    for &idx in row_indexes.iter().skip(1) {
+                        min_idx = std::cmp::min(min_idx, idx);
+                        max_idx = std::cmp::max(max_idx, idx);
+                    }
+
+                    let span_start = min_idx as usize;
+                    let span_len = (max_idx - min_idx) as usize + 1;
+                    let parts = col_decoder.decode_row_at(span_start, span_len)?;
+                    if parts.is_empty() {
+                        return Err(Error::General(
+                            "Selection decode returned no arrays".to_string(),
+                        ));
+                    }
+                    let decoded_span = concat(
+                        &parts.iter().map(|a| a.as_ref()).collect::<Vec<_>>(),
+                    )?;
+
+                    // Preserve request order (and duplicates) via take(indices = row_id - min).
+                    let take_indices = UInt32Array::from(
+                        row_indexes
+                            .iter()
+                            .map(|&idx| (idx - min_idx) as u32)
+                            .collect::<Vec<u32>>(),
+                    );
+                    let taken = arrow::compute::take(&decoded_span, &take_indices, None)?;
+                    columns.push(vec![taken]);
+                }
+            }
             Ok(())
         };
         // TODO: needs some magic to handle nested data. Basically needs to go over the schema recursively
@@ -457,57 +494,39 @@ pub fn process_selection<'a>(
                 .collect()
         }
         Selection::RowIndexes(row_indexes) => {
-            // Early return if there are no row indexes
             if row_indexes.is_empty() {
                 return vec![];
             }
 
-            // For optimization, we'll work with sorted row indexes
-            let mut sorted_indexes = row_indexes.clone();
-            sorted_indexes.sort_unstable();
-
-            let mut result = Vec::new();
-            let mut cumulative_row_count = 0u64;
-            let mut current_idx_pos = 0; // Position in the sorted_indexes array
-
-            // Process each group once, advancing through the sorted indexes
-            for metadata in grouped_metadata {
-                let row_count = metadata.row_count as u64;
-                let start_row = cumulative_row_count;
-                let end_row = start_row + row_count;
-
-                // Find all indexes that fall within this group's range
-                let mut group_indexes = Vec::new();
-
-                // Skip indexes that are below this group's range
-                while current_idx_pos < sorted_indexes.len()
-                    && sorted_indexes[current_idx_pos] < start_row
-                {
-                    current_idx_pos += 1;
-                }
-
-                // Collect indexes that fall within this group's range
-                while current_idx_pos < sorted_indexes.len()
-                    && sorted_indexes[current_idx_pos] < end_row
-                {
-                    group_indexes.push(sorted_indexes[current_idx_pos] - start_row);
-                    current_idx_pos += 1;
-                }
-
-                // Only include this group if it contains at least one selected row
-                if !group_indexes.is_empty() {
-                    result.push((metadata, Selection::RowIndexes(group_indexes)));
-                }
-
-                cumulative_row_count = end_row;
-
-                // Early exit if we've processed all row indexes
-                if current_idx_pos >= sorted_indexes.len() {
-                    break;
-                }
+            // Preserve the caller-provided order of row indexes. We'll do per-row-group grouping
+            // without sorting here; row-group-local decoding can still sort/merge ranges later.
+            let mut starts = Vec::with_capacity(grouped_metadata.len());
+            let mut ends = Vec::with_capacity(grouped_metadata.len());
+            let mut cumulative = 0u64;
+            for meta in grouped_metadata {
+                starts.push(cumulative);
+                cumulative += meta.row_count as u64;
+                ends.push(cumulative);
             }
 
-            result
+            let mut per_group = vec![Vec::<u64>::new(); grouped_metadata.len()];
+            for &idx in row_indexes {
+                if idx >= cumulative {
+                    continue;
+                }
+                let g = ends.partition_point(|end| *end <= idx);
+                let start = starts[g];
+                per_group[g].push(idx - start);
+            }
+
+            grouped_metadata
+                .iter()
+                .enumerate()
+                .filter_map(|(g, meta)| {
+                    let group_indexes = &per_group[g];
+                    (!group_indexes.is_empty()).then(|| (meta, Selection::RowIndexes(group_indexes.clone())))
+                })
+                .collect()
         }
     }
 }

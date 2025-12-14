@@ -49,12 +49,6 @@ impl<R: Reader + Clone> FileReaderV2Builder<R> {
     }
 
     pub fn with_selection(mut self, selection: Selection) -> Self {
-        if let Selection::RowIndexes(row_indexes) = &selection {
-            assert!(
-                row_indexes.len() == 1,
-                "Only one row index is supported for experiment purposes"
-            );
-        }
         self.selection = selection;
         self
     }

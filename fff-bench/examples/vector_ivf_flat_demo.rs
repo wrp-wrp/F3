@@ -1,0 +1,108 @@
+use anyhow::{anyhow, Context, Result};
+use arrow_array::cast::AsArray;
+use arrow_array::FixedSizeListArray;
+use clap::Parser;
+use fff_poc::reader::{FileReaderV2Builder, Projection, Selection};
+use fff_vindex::ivf_flat::{build_ivf_flat_sidecar, load_ivf_flat_index, search_ivf_flat, IvfFlatBuildOptions};
+use std::fs::File;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+#[derive(Parser, Debug)]
+struct Args {
+    #[arg(long)]
+    base_f3: PathBuf,
+
+    /// Leaf column index of the vector column in the base file schema.
+    #[arg(long)]
+    vector_leaf_index: usize,
+
+    /// Vector dimension.
+    #[arg(long)]
+    dim: usize,
+
+    #[arg(long, default_value = "emb_ivf_flat")]
+    index_name: String,
+
+    #[arg(long, default_value_t = 1024)]
+    nlist: usize,
+
+    #[arg(long, default_value_t = 200_000)]
+    train_sample: usize,
+
+    #[arg(long, default_value_t = 1)]
+    seed: u64,
+
+    #[arg(long, default_value_t = 20)]
+    max_kmeans_iters: usize,
+
+    #[arg(long, default_value_t = 10)]
+    k: usize,
+
+    #[arg(long, default_value_t = 8)]
+    nprobe: usize,
+}
+
+fn main() -> Result<()> {
+    let args = Args::parse();
+
+    let index_path = build_ivf_flat_sidecar(
+        &args.base_f3,
+        args.vector_leaf_index,
+        args.dim,
+        &args.index_name,
+        IvfFlatBuildOptions {
+            nlist: args.nlist,
+            train_sample: args.train_sample,
+            seed: args.seed,
+            max_kmeans_iters: args.max_kmeans_iters,
+        },
+    )
+    .with_context(|| "build ivf-flat index")?;
+
+    let query = read_first_vector(&args.base_f3, args.vector_leaf_index, args.dim)?;
+    let index = load_ivf_flat_index(&index_path)?;
+    let results = search_ivf_flat(&index, &query, args.k, args.nprobe)?;
+
+    println!("index: {}", index_path.display());
+    println!("top{} (nprobe={}):", results.len(), args.nprobe);
+    for r in results {
+        println!("row_id={} dist={}", r.row_id, r.distance);
+    }
+    Ok(())
+}
+
+fn read_first_vector(base_f3: &PathBuf, leaf: usize, dim: usize) -> Result<Vec<f32>> {
+    let file = File::open(base_f3).with_context(|| format!("open {}", base_f3.display()))?;
+    let mut reader = FileReaderV2Builder::new(Arc::new(file))
+        .with_projections(Projection::All)
+        .with_selection(Selection::RowIndexes(vec![0]))
+        .build()
+        .map_err(|e| anyhow!(e.to_string()))?;
+    let batches = reader
+        .read_file()
+        .map_err(|e| anyhow!(e.to_string()))
+        .with_context(|| "read first vector")?;
+    let batch = batches.first().ok_or_else(|| anyhow!("no batches"))?;
+    if leaf >= batch.num_columns() {
+        return Err(anyhow!(
+            "vector_leaf_index out of range: {} >= {}",
+            leaf,
+            batch.num_columns()
+        ));
+    }
+    let col = batch.column(leaf);
+    let fsl = col
+        .as_any()
+        .downcast_ref::<FixedSizeListArray>()
+        .ok_or_else(|| anyhow!("projected column is not FixedSizeListArray"))?;
+    if fsl.value_length() as usize != dim {
+        return Err(anyhow!(
+            "dim mismatch: expected {}, got {}",
+            dim,
+            fsl.value_length()
+        ));
+    }
+    let values = fsl.values().as_primitive::<arrow::datatypes::Float32Type>();
+    Ok(values.values()[..dim].to_vec())
+}

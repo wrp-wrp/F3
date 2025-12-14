@@ -13,7 +13,7 @@ use crate::{
 use arrow_array::cast::AsArray;
 use arrow_array::Array;
 use arrow_array::ArrayRef;
-use arrow_array::{BooleanArray, Int32Array, Int64Array};
+use arrow_array::{BooleanArray, FixedSizeListArray, Int32Array, Int64Array};
 use arrow_buffer::BooleanBuffer;
 use arrow_schema::{DataType, FieldRef};
 use fff_core::{errors::Result, non_nest_types};
@@ -116,6 +116,75 @@ pub struct ListColEncoder {
     /// This column index is for offsets column.
     column_index: u32,
     values_encoder: Box<dyn LogicalColEncoder>,
+}
+
+pub struct FixedSizeListColEncoder {
+    validity_encoder: Box<dyn PhysicalColEncoder>,
+    validity_column_index: u32,
+    values_encoder: Box<dyn PhysicalColEncoder>,
+    values_column_index: u32,
+    list_size: i32,
+}
+
+impl LogicalColEncoder for FixedSizeListColEncoder {
+    fn encode(
+        &mut self,
+        array: ArrayRef,
+        counter: &mut EncodingCounter,
+        shared_dict_ctx: &mut SharedDictionaryContext,
+    ) -> Result<Option<Vec<EncodedColumnChunk>>> {
+        let fsl = array
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .expect("FixedSizeListColEncoder expects FixedSizeListArray");
+        assert_eq!(fsl.value_length(), self.list_size);
+
+        let mut res = vec![];
+        let validity = extract_validity(array.as_ref());
+        for chunk in self
+            .validity_encoder
+            .encode(validity, counter, shared_dict_ctx)?
+        {
+            res.push(chunk.update_column_index(self.validity_column_index));
+        }
+
+        let dim = self.list_size as usize;
+        let values_start = array.offset() * dim;
+        let values_len = array.len() * dim;
+        let values = fsl.values().slice(values_start, values_len);
+        for chunk in self
+            .values_encoder
+            .encode(values, counter, shared_dict_ctx)?
+        {
+            res.push(chunk.update_column_index(self.values_column_index));
+        }
+
+        Ok((!res.is_empty()).then_some(res))
+    }
+
+    fn memory_size(&self) -> usize {
+        self.validity_encoder.memory_size() + self.values_encoder.memory_size()
+    }
+
+    fn finish(
+        &mut self,
+        counter: &mut EncodingCounter,
+        shared_dict_ctx: &mut SharedDictionaryContext,
+    ) -> Result<Option<Vec<EncodedColumnChunk>>> {
+        let mut res = vec![];
+        for chunk in self.validity_encoder.finish(counter, shared_dict_ctx)? {
+            res.push(chunk.update_column_index(self.validity_column_index));
+        }
+        for chunk in self.values_encoder.finish(counter, shared_dict_ctx)? {
+            res.push(chunk.update_column_index(self.values_column_index));
+        }
+        Ok((!res.is_empty()).then_some(res))
+    }
+
+    fn submit_dict(&mut self, shared_dict_ctx: &mut SharedDictionaryContext) -> Result<()> {
+        self.validity_encoder.submit_dict(shared_dict_ctx)?;
+        self.values_encoder.submit_dict(shared_dict_ctx)
+    }
 }
 
 impl LogicalColEncoder for ListColEncoder {
@@ -336,6 +405,36 @@ pub fn create_logical_encoder(
             }),
             LogicalTree::new(fb::LogicalId::FLAT, vec![]),
         )),
+        DataType::FixedSizeList(child, list_size)
+            if matches!(child.data_type(), non_nest_types!()) =>
+        {
+            let validity_index = column_idx.next_column_index();
+            let values_index = column_idx.next_column_index();
+            Ok((
+                Box::new(FixedSizeListColEncoder {
+                    validity_encoder: create_physical_encoder(
+                        &DataType::Boolean,
+                        max_chunk_size,
+                        false,
+                        wasm_context.clone(),
+                        dictionary_type,
+                        compression_type,
+                    )?,
+                    validity_column_index: validity_index,
+                    values_encoder: create_physical_encoder(
+                        child.data_type(),
+                        max_chunk_size,
+                        false,
+                        wasm_context,
+                        dictionary_type,
+                        compression_type,
+                    )?,
+                    values_column_index: values_index,
+                    list_size: *list_size,
+                }),
+                LogicalTree::new(fb::LogicalId::LIST, vec![]),
+            ))
+        }
         DataType::List(child) | DataType::LargeList(child) => {
             match child.data_type() {
                 // Pushingdown List offsets only works for List(Struct(non_nest_type!()))

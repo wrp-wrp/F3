@@ -7,7 +7,7 @@ pub use crate::dict::DictionaryTypeOptions;
 use crate::{
     common::checksum::ChecksumType,
     context::{WASMId, WASMWritingContext, WasmLib},
-    vector_index::VectorIndexConfig,
+    vector_index::{VectorIndexBuildConfig, VectorIndexConfig},
 };
 
 pub const DEFAULT_IOUNIT_SIZE: u64 = 8 * 1024 * 1024; // in bytes
@@ -40,6 +40,8 @@ pub struct FileWriterOptions {
     compression_type: CompressionType,
     /// Vector index descriptors to embed in the file.
     vector_indexes: Vec<VectorIndexConfig>,
+    /// Vector indexes to build from vector columns and embed in the file.
+    vector_index_builds: Vec<VectorIndexBuildConfig>,
 }
 
 impl Default for FileWriterOptions {
@@ -108,6 +110,14 @@ impl FileWriterOptions {
     pub fn take_vector_indexes(&mut self) -> Vec<VectorIndexConfig> {
         std::mem::take(&mut self.vector_indexes)
     }
+
+    pub fn vector_index_builds(&self) -> &[VectorIndexBuildConfig] {
+        &self.vector_index_builds
+    }
+
+    pub fn take_vector_index_builds(&mut self) -> Vec<VectorIndexBuildConfig> {
+        std::mem::take(&mut self.vector_index_builds)
+    }
 }
 
 pub struct FileWriterOptionsBuilder {
@@ -137,6 +147,7 @@ pub struct FileWriterOptionsBuilder {
     /// The type of compression to use for EncUnits
     compression_type: CompressionType,
     vector_indexes: Vec<VectorIndexConfig>,
+    vector_index_builds: Vec<VectorIndexBuildConfig>,
 }
 
 impl FileWriterOptionsBuilder {
@@ -154,6 +165,7 @@ impl FileWriterOptionsBuilder {
             enable_io_unit_checksum: false,
             compression_type: CompressionType::Uncompressed,
             vector_indexes: Vec::new(),
+            vector_index_builds: Vec::new(),
         }
     }
 
@@ -173,6 +185,7 @@ impl FileWriterOptionsBuilder {
             enable_io_unit_checksum: self.enable_io_unit_checksum,
             compression_type: self.compression_type,
             vector_indexes: self.vector_indexes,
+            vector_index_builds: self.vector_index_builds,
         }
     }
 
@@ -231,6 +244,11 @@ impl FileWriterOptionsBuilder {
 
     pub fn add_vector_index(mut self, config: VectorIndexConfig) -> Self {
         self.vector_indexes.push(config);
+        self
+    }
+
+    pub fn add_vector_index_build(mut self, config: VectorIndexBuildConfig) -> Self {
+        self.vector_index_builds.push(config);
         self
     }
 }

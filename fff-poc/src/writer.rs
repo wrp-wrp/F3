@@ -4,7 +4,7 @@ use std::io::{BufWriter, Seek, Write};
 use std::iter::once;
 use std::sync::Arc;
 
-use arrow_array::RecordBatch;
+use arrow_array::{Array, ArrayRef, RecordBatch};
 use arrow_ipc::writer::IpcWriteOptions;
 use arrow_ipc::writer::{DictionaryTracker, IpcDataGenerator};
 use arrow_schema::Schema;
@@ -32,6 +32,8 @@ use crate::file::footer::{
 };
 use crate::options::FileWriterOptions;
 use crate::vector_index::{VectorIndexConfig, VectorIndexDescriptor};
+use crate::vector_index::{VectorIndexBuildAlgorithm, VectorIndexBuildConfig};
+use crate::vector_index::{encode_bruteforce_index, encode_hnsw_index, VectorIndexAlgorithm};
 
 use fff_core::{
     errors::{Error, Result},
@@ -187,6 +189,191 @@ pub struct FileWriter<W: Write + Seek> {
     row_group_size: u64,
     shared_dictionary_context: SharedDictionaryContext,
     vector_indexes: Vec<VectorIndexConfig>,
+    vector_index_builds: Vec<VectorIndexBuildState>,
+}
+
+#[derive(Clone, Debug)]
+struct VectorIndexBuildState {
+    config: VectorIndexBuildConfig,
+    column_index: usize,
+    dimension: Option<usize>,
+    vectors: Vec<Vec<f32>>,
+}
+
+impl VectorIndexBuildState {
+    fn try_new(config: VectorIndexBuildConfig, schema: &Schema) -> Result<Self> {
+        let column_index = schema
+            .fields()
+            .iter()
+            .position(|field| field.name() == &config.column)
+            .ok_or_else(|| {
+                Error::General(format!(
+                    "Vector index build column '{}' not found in schema",
+                    config.column
+                ))
+            })?;
+        Ok(Self {
+            config,
+            column_index,
+            dimension: None,
+            vectors: Vec::new(),
+        })
+    }
+
+    fn push_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        let array = batch.column(self.column_index);
+        let vectors = extract_f32_vectors(array)?;
+        for vec in vectors {
+            if vec.is_empty() {
+                return Err(Error::General(
+                    "Vector index build does not support empty vectors".to_string(),
+                ));
+            }
+            match self.dimension {
+                None => self.dimension = Some(vec.len()),
+                Some(dim) if dim != vec.len() => {
+                    return Err(Error::General(format!(
+                        "Vector index build dimension mismatch for column '{}': expected {}, got {}",
+                        self.config.column, dim, vec.len()
+                    )));
+                }
+                _ => {}
+            }
+            self.vectors.push(vec);
+        }
+        Ok(())
+    }
+
+    fn build(self) -> Result<VectorIndexConfig> {
+        let dim = self.dimension.unwrap_or(0);
+        if self.vectors.is_empty() {
+            return Err(Error::General(format!(
+                "Vector index build for column '{}' has no vectors",
+                self.config.column
+            )));
+        }
+        let mut quantization = self.config.quantization;
+        if quantization.dimension == 0 && dim > 0 {
+            quantization.dimension = dim as u32;
+        }
+
+        let (algorithm, data) = match self.config.algorithm {
+            VectorIndexBuildAlgorithm::BruteForce => (
+                VectorIndexAlgorithm::BruteForce,
+                encode_bruteforce_index(&self.vectors)?,
+            ),
+            VectorIndexBuildAlgorithm::Hnsw {
+                max_neighbors,
+                ef_search,
+            } => (
+                VectorIndexAlgorithm::Hnsw,
+                encode_hnsw_index(&self.vectors, max_neighbors, ef_search)?,
+            ),
+        };
+
+        Ok(VectorIndexConfig {
+            index_id: self.config.index_id,
+            column: self.config.column,
+            algorithm,
+            distance_metric: self.config.distance_metric,
+            priority: self.config.priority,
+            usage_hint: self.config.usage_hint,
+            quantization,
+            custom_params: self.config.custom_params,
+            data,
+            wasm_module: None,
+        })
+    }
+}
+
+fn extract_f32_vectors(array: &ArrayRef) -> Result<Vec<Vec<f32>>> {
+    use arrow_array::{Float32Array, LargeListArray, ListArray};
+    use arrow_schema::DataType;
+
+    match array.data_type() {
+        DataType::List(field) => {
+            if field.data_type() != &DataType::Float32 {
+                return Err(Error::General(format!(
+                    "Vector index build requires List<Float32>, got {:?}",
+                    array.data_type()
+                )));
+            }
+            let list = array
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .ok_or_else(|| Error::General("Unable to downcast ListArray".to_string()))?;
+            if list.null_count() > 0 {
+                return Err(Error::General(
+                    "Vector index build does not support null lists".to_string(),
+                ));
+            }
+            let values = list.values();
+            let floats = values
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| Error::General("Unable to downcast Float32Array".to_string()))?;
+            if floats.null_count() > 0 {
+                return Err(Error::General(
+                    "Vector index build does not support null vector items".to_string(),
+                ));
+            }
+            let offsets = list.offsets();
+            let mut out = Vec::with_capacity(list.len());
+            for row in 0..list.len() {
+                let start = offsets[row] as usize;
+                let end = offsets[row + 1] as usize;
+                let mut vec = Vec::with_capacity(end - start);
+                for idx in start..end {
+                    vec.push(floats.value(idx));
+                }
+                out.push(vec);
+            }
+            Ok(out)
+        }
+        DataType::LargeList(field) => {
+            if field.data_type() != &DataType::Float32 {
+                return Err(Error::General(format!(
+                    "Vector index build requires LargeList<Float32>, got {:?}",
+                    array.data_type()
+                )));
+            }
+            let list = array
+                .as_any()
+                .downcast_ref::<LargeListArray>()
+                .ok_or_else(|| Error::General("Unable to downcast LargeListArray".to_string()))?;
+            if list.null_count() > 0 {
+                return Err(Error::General(
+                    "Vector index build does not support null lists".to_string(),
+                ));
+            }
+            let values = list.values();
+            let floats = values
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| Error::General("Unable to downcast Float32Array".to_string()))?;
+            if floats.null_count() > 0 {
+                return Err(Error::General(
+                    "Vector index build does not support null vector items".to_string(),
+                ));
+            }
+            let offsets = list.offsets();
+            let mut out = Vec::with_capacity(list.len());
+            for row in 0..list.len() {
+                let start = offsets[row] as usize;
+                let end = offsets[row + 1] as usize;
+                let mut vec = Vec::with_capacity(end - start);
+                for idx in start..end {
+                    vec.push(floats.value(idx));
+                }
+                out.push(vec);
+            }
+            Ok(out)
+        }
+        other => Err(Error::General(format!(
+            "Vector index build requires List<Float32> column, got {:?}",
+            other
+        ))),
+    }
 }
 
 impl<W: Write + Seek> FileWriter<W> {
@@ -227,6 +414,11 @@ impl<W: Write + Seek> FileWriter<W> {
             child_trees.push(child_tree);
         }
         let num_physical_columns = column_idx.get_current_index() as usize;
+        let vector_index_builds = options
+            .take_vector_index_builds()
+            .into_iter()
+            .map(|cfg| VectorIndexBuildState::try_new(cfg, schema.as_ref()))
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             schema: schema.as_ref().clone(),
             column_encoders,
@@ -252,6 +444,7 @@ impl<W: Write + Seek> FileWriter<W> {
             row_group_size: options.row_group_size(),
             shared_dictionary_context,
             vector_indexes: options.take_vector_indexes(),
+            vector_index_builds,
         })
     }
 
@@ -291,6 +484,9 @@ impl<W: Write + Seek> FileWriter<W> {
                     .try_for_each(|chunk| self.state.flush_chunk(chunk))?;
             }
         }
+        for build in &mut self.vector_index_builds {
+            build.push_batch(batch)?;
+        }
         self.state.num_rows_in_file += batch.num_rows() as u32;
         self.state.num_rows_in_cur_row_group += batch.num_rows() as u32;
         if self.state.num_rows_in_cur_row_group as u64 >= self.row_group_size {
@@ -319,7 +515,10 @@ impl<W: Write + Seek> FileWriter<W> {
     }
 
     pub fn finish(mut self) -> Result<Vec<EncodingCounter>> {
-        let vector_configs = std::mem::take(&mut self.vector_indexes);
+        let mut vector_configs = std::mem::take(&mut self.vector_indexes);
+        for build in std::mem::take(&mut self.vector_index_builds) {
+            vector_configs.push(build.build()?);
+        }
         // if dictionary mode is global with sharing, first submit all values to dictionary context
         if self.shared_dictionary_context.is_multi_col_sharing() {
             for encoder in self.column_encoders.iter_mut() {

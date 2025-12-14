@@ -293,6 +293,27 @@ pub struct VectorIndexConfig {
     pub wasm_module: Option<Vec<u8>>,
 }
 
+#[derive(Clone, Debug)]
+pub enum VectorIndexBuildAlgorithm {
+    BruteForce,
+    Hnsw {
+        max_neighbors: usize,
+        ef_search: usize,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub struct VectorIndexBuildConfig {
+    pub index_id: u32,
+    pub column: String,
+    pub algorithm: VectorIndexBuildAlgorithm,
+    pub distance_metric: VectorDistanceMetric,
+    pub priority: u16,
+    pub usage_hint: Option<String>,
+    pub quantization: QuantizationSpec,
+    pub custom_params: Vec<u8>,
+}
+
 impl Default for VectorIndexConfig {
     fn default() -> Self {
         Self {

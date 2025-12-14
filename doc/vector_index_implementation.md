@@ -17,7 +17,8 @@
 推荐索引目录结构：
 
 - `/path/data.f3.vindex/manifest.json`
-- `/path/data.f3.vindex/<index_name>.f3`（索引本体，IVFFlat/IVFPQ 都是独立 F3 文件）
+- `/path/data.f3.vindex/<index_name>.ivf_flat`（IVFFlat 索引本体，自定义格式）
+- `/path/data.f3.vindex/<index_name>.ivf_pq`（IVFPQ 索引本体，自定义格式，第二阶段）
 
 说明：
 
@@ -75,24 +76,28 @@
 
 ---
 
-## 5. IVFFlat 索引文件 schema（索引也是 F3）
+## 5. IVFFlat 索引文件格式（自定义二进制，便于 WASM codec）
 
-IVFFlat 的核心数据长度天然不一致：`centroids(nlist*dim)`、`offsets(nlist+1)`、`row_ids(N)`、`vectors(N*dim)`。
+IVFFlat 的核心数据长度天然不一致：`centroids(nlist*dim)`、`offsets(nlist+1)`、`row_ids(N)`、`vectors(N*dim)`，并且索引访问模式偏“按 list / block 随机读”。
 
-如果把它们直接做成同一层级的 4 列，会违反 Arrow `RecordBatch`“所有列行数必须一致”的要求。
+因此索引文件更适合做成**自定义二进制结构**（sidecar），并把压缩/解码/距离计算作为可插拔 codec（后续可由 WASM 管理）。
 
-因此索引文件采用 **Lance 风格的对齐方式**：以 `nlist` 为“顶层行数”，把倒排 posting lists 存成 `ListArray`（offsets + values），从而让所有列都拥有相同的顶层行数。
+当前实现的最小落盘格式（little-endian）：
 
-推荐 schema（行数 = `nlist`）：
+- magic: `b"F3IVFF1\\0"`（8 bytes）
+- version: `u32`
+- dim: `u32`
+- nlist: `u32`
+- vector_leaf_index: `u32`
+- base_schema_checksum: `u64`
+- base_data_checksum: `u64`
+- centroids_len: `u64`（元素个数，f32）
+- list_offsets_len: `u64`（元素个数，u64，= nlist+1）
+- row_ids_len: `u64`（元素个数，u32）
+- vectors_len: `u64`（元素个数，f32，= row_ids_len*dim）
+- payload：依次写入 `centroids[f32]`、`list_offsets[u64]`、`row_ids[u32]`、`vectors[f32]`
 
-1. `centroids: FixedSizeList<Float32>(dim)`（长度 `nlist`）
-2. `postings_row_ids: List<UInt32>`（长度 `nlist`；第 i 行是第 i 个 centroid 的 row_id 列表）
-3. `postings_vectors: List<Float32>`（长度 `nlist`；第 i 行是第 i 个 centroid 下所有向量的扁平化 floats，长度应为 `postings_row_ids[i].len() * dim`）
-
-索引元信息同时放两处：
-
-- `manifest.json`：用于多索引 catalog、base 绑定校验、build params、quantization（后续）
-- index `.f3` schema metadata：用于快速自描述（kind/metric/dim/nlist/vector_leaf_index/base checksums）
+索引元信息以 `manifest.json` 为准（多索引 catalog、base 绑定校验、build params、quantization 等）。
 
 ---
 
@@ -166,7 +171,7 @@ Phase 1（IVFFlat 闭环）：
 
 1. 新增 crate `fff-vindex`（workspace member）
 2. 实现 `manifest.json` 读写 + `IndexCatalog`（多索引）
-3. 实现 IVFFlat 构建（kmeans + assign + 写索引 `.f3`）
+3. 实现 IVFFlat 构建（kmeans + assign + 写索引 `.ivf_flat`）
 4. 实现 IVFFlat 查询（nprobe 召回 + vectors 精排）
 5. 提供 `fff-bench/examples/` demo（build + search）
 

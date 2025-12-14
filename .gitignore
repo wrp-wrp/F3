@@ -5,6 +5,7 @@ __pycache__
 .idea
 build
 data_*
+data/sift/
 
 # for storing aws credentials
 .env 

@@ -67,6 +67,14 @@ struct Args {
     #[arg(long, default_value = "raw")]
     artifact_posting_codec: String,
 
+    /// Enable decoded posting cache for native artifact searcher.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    artifact_native_decoded_cache: bool,
+
+    /// Clear native decoded cache before each measured iteration (forces cold behavior).
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    artifact_native_clear_each_iter: bool,
+
     /// Disable host-side chunk cache for wasm kernel (forces reads each time).
     #[arg(long, default_value_t = false)]
     artifact_wasm_no_cache: bool,
@@ -253,8 +261,12 @@ fn main() -> Result<()> {
                 })
             );
         }
-        let searcher = IvfFlatArtifactSearcher::open(&index_path)?;
+        let searcher =
+            IvfFlatArtifactSearcher::open_with_options(&index_path, args.artifact_native_decoded_cache)?;
         for _ in 0..args.warmup {
+            if args.artifact_native_clear_each_iter {
+                searcher.clear_posting_cache();
+            }
             for q in 0..args.nq {
                 let query = &queries[q * args.dim..(q + 1) * args.dim];
                 let _ = searcher.search(query, args.k, args.nprobe)?;
@@ -262,6 +274,9 @@ fn main() -> Result<()> {
         }
         let mut last = Vec::new();
         for it in 0..args.repeat {
+            if args.artifact_native_clear_each_iter {
+                searcher.clear_posting_cache();
+            }
             let run_start = Instant::now();
             for q in 0..args.nq {
                 let query = &queries[q * args.dim..(q + 1) * args.dim];

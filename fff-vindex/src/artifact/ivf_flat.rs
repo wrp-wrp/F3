@@ -996,10 +996,15 @@ pub struct IvfFlatArtifactSearcher {
     file: File,
     centroids: Vec<f32>,
     posting_cache: RefCell<HashMap<u32, (Vec<u32>, Vec<f32>)>>,
+    posting_cache_enabled: bool,
 }
 
 impl IvfFlatArtifactSearcher {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_options(path, /*posting_cache_enabled=*/true)
+    }
+
+    pub fn open_with_options(path: impl AsRef<Path>, posting_cache_enabled: bool) -> Result<Self> {
         let artifact = IvfFlatArtifact::open(path)?;
         let file = artifact.open_data_file()?;
         let centroids = artifact.read_centroids_f32_from_file(&file)?;
@@ -1008,11 +1013,16 @@ impl IvfFlatArtifactSearcher {
             file,
             centroids,
             posting_cache: RefCell::new(HashMap::new()),
+            posting_cache_enabled,
         })
     }
 
     pub fn artifact(&self) -> &IvfFlatArtifact {
         &self.artifact
+    }
+
+    pub fn clear_posting_cache(&self) {
+        self.posting_cache.borrow_mut().clear();
     }
 
     pub fn search(&self, query: &[f32], k: usize, nprobe: usize) -> Result<Vec<SearchResult>> {
@@ -1044,30 +1054,58 @@ impl IvfFlatArtifactSearcher {
             std::collections::BinaryHeap::new();
         for (cid, _) in centroid_dists {
             let cid_u32 = cid as u32;
-            if !self.posting_cache.borrow().contains_key(&cid_u32) {
+            if self.posting_cache_enabled {
+                if !self.posting_cache.borrow().contains_key(&cid_u32) {
+                    let decoded = self
+                        .artifact
+                        .read_posting_list_from_file(&self.file, cid_u32)?;
+                    self.posting_cache.borrow_mut().insert(cid_u32, decoded);
+                }
+                let cache = self.posting_cache.borrow();
+                let Some((row_ids, vectors)) = cache.get(&cid_u32) else {
+                    continue;
+                };
+                for (pos, &row_id) in row_ids.iter().enumerate() {
+                    let start = pos * dim;
+                    let v = &vectors[start..start + dim];
+                    let dist = crate::ivf_flat::l2_sq(query, v);
+                    let dist_nn = ordered_float::NotNan::new(dist)
+                        .map_err(|_| anyhow::anyhow!("distance is NaN"))?;
+                    if heap.len() < k {
+                        heap.push((dist_nn, row_id));
+                    } else if let Some(&(worst, _)) = heap.peek() {
+                        if dist_nn < worst {
+                            heap.pop();
+                            heap.push((dist_nn, row_id));
+                        }
+                    }
+                }
+                continue;
+            } else {
                 let decoded = self
                     .artifact
                     .read_posting_list_from_file(&self.file, cid_u32)?;
-                self.posting_cache.borrow_mut().insert(cid_u32, decoded);
-            }
-            let cache = self.posting_cache.borrow();
-            let Some((row_ids, vectors)) = cache.get(&cid_u32) else {
-                continue;
-            };
-            for (pos, &row_id) in row_ids.iter().enumerate() {
-                let start = pos * dim;
-                let v = &vectors[start..start + dim];
-                let dist = crate::ivf_flat::l2_sq(query, v);
-                let dist_nn = ordered_float::NotNan::new(dist)
-                    .map_err(|_| anyhow::anyhow!("distance is NaN"))?;
-                if heap.len() < k {
-                    heap.push((dist_nn, row_id));
-                } else if let Some(&(worst, _)) = heap.peek() {
-                    if dist_nn < worst {
-                        heap.pop();
+                // Use locals for this list only.
+                // Keep owned buffers alive until we're done scanning.
+                let (r, v) = decoded;
+
+                // Scan using the owned buffers, then continue.
+                for (pos, &row_id) in r.iter().enumerate() {
+                    let start = pos * dim;
+                    let vec_slice = &v[start..start + dim];
+                    let dist = crate::ivf_flat::l2_sq(query, vec_slice);
+                    let dist_nn = ordered_float::NotNan::new(dist)
+                        .map_err(|_| anyhow::anyhow!("distance is NaN"))?;
+                    if heap.len() < k {
                         heap.push((dist_nn, row_id));
+                    } else if let Some(&(worst, _)) = heap.peek() {
+                        if dist_nn < worst {
+                            heap.pop();
+                            heap.push((dist_nn, row_id));
+                        }
                     }
                 }
+                continue;
             }
         }
 

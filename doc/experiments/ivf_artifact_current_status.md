@@ -106,6 +106,26 @@ Wasm 的每次迭代 JSON 行现在包含这些字段（来自 `vector_ivf_flat_
 
 两组都报 `Recall@k` + `p50/p99 latency`，并在图注明确说明编译/运行配置（否则审稿人会认为不公平）。
 
+## 严格对齐实验（native vs wasm，cold/warm）
+
+为避免“native 热、wasm 冷”或缓存策略不一致，提供了严格对齐脚本：
+
+- 运行：`bash scripts/run_sift_ivf_aligned.sh`
+- 本地结果目录（一次样例）：`results/sift_ivf_aligned_20251215_234858/`
+
+该脚本固定 `nq=32, nlist=64, nprobe=16, k=10`，并对 `f32/raw` 与 `f16/raw_f16` 各自跑：
+- `native warm`：native decoded posting cache 开
+- `native cold`：native decoded posting cache 关
+- `wasm warm`：host chunk cache 开 + wasm kernel decoded cache 开（对 f16）
+- `wasm cold`：host chunk cache 关 + wasm kernel decoded cache 关（对 f16）
+
+一轮汇总（p50 wall_ms，见 `results/sift_ivf_aligned_20251215_234858/`）：
+- `native_f32_warm ≈ 28.458ms`，`native_f32_cold ≈ 63.979ms`
+- `wasm_f32_warm ≈ 84.403ms`，`wasm_f32_cold ≈ 98.482ms`
+- `native_f16_warm ≈ 29.250ms`，`native_f16_cold ≈ 106.432ms`
+- `wasm_f16_warm ≈ 49.497ms`，`wasm_f16_cold ≈ 168.798ms`
+
+
 ### Size 拆分（同一份 index 文件）
 
 以 `row_id_delta_varint_v1` 为例（`python3 scripts/ivf_artifact_chunk_breakdown.py ...`）：

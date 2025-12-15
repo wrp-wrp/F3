@@ -13,6 +13,8 @@ use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::cell::RefCell;
+use std::collections::HashMap;
 
 const ARTIFACT_MAGIC: &[u8; 8] = b"F3VIDX1\0";
 const ARTIFACT_FOOTER_MAGIC: &[u8; 8] = b"F3VIDXF\0";
@@ -993,6 +995,7 @@ pub struct IvfFlatArtifactSearcher {
     artifact: IvfFlatArtifact,
     file: File,
     centroids: Vec<f32>,
+    posting_cache: RefCell<HashMap<u32, (Vec<u32>, Vec<f32>)>>,
 }
 
 impl IvfFlatArtifactSearcher {
@@ -1004,6 +1007,7 @@ impl IvfFlatArtifactSearcher {
             artifact,
             file,
             centroids,
+            posting_cache: RefCell::new(HashMap::new()),
         })
     }
 
@@ -1039,7 +1043,17 @@ impl IvfFlatArtifactSearcher {
         let mut heap: std::collections::BinaryHeap<(ordered_float::NotNan<f32>, u32)> =
             std::collections::BinaryHeap::new();
         for (cid, _) in centroid_dists {
-            let (row_ids, vectors) = self.artifact.read_posting_list_from_file(&self.file, cid as u32)?;
+            let cid_u32 = cid as u32;
+            if !self.posting_cache.borrow().contains_key(&cid_u32) {
+                let decoded = self
+                    .artifact
+                    .read_posting_list_from_file(&self.file, cid_u32)?;
+                self.posting_cache.borrow_mut().insert(cid_u32, decoded);
+            }
+            let cache = self.posting_cache.borrow();
+            let Some((row_ids, vectors)) = cache.get(&cid_u32) else {
+                continue;
+            };
             for (pos, &row_id) in row_ids.iter().enumerate() {
                 let start = pos * dim;
                 let v = &vectors[start..start + dim];

@@ -13,7 +13,7 @@ use wasmtime::{Caller, Engine, Linker, Memory, Module, Store, TypedFunc};
 struct HostState {
     artifact: Option<Arc<IvfFlatArtifact>>,
     file: Option<File>,
-    cache: HashMap<u32, Vec<u8>>,
+    cache: HashMap<u32, Arc<[u8]>>,
     raw_lens: Vec<u64>,
     lens: Vec<u32>,
     stats: FetchStats,
@@ -50,40 +50,34 @@ impl HostState {
         Ok(self.lens.get(chunk_id as usize).copied().unwrap_or(0))
     }
 
-    fn read_chunk_into(&mut self, chunk_id: u32, dst: &mut [u8]) -> Result<u32> {
-        let bytes = if let Some(buf) = self.cache.get(&chunk_id) {
+    fn get_chunk_bytes(&mut self, chunk_id: u32) -> Result<Arc<[u8]>> {
+        if let Some(buf) = self.cache.get(&chunk_id) {
             self.stats.cache_hits += 1;
             self.stats.note_chunk(chunk_id, /*miss=*/false);
-            buf.clone()
-        } else {
-            let artifact = self
-                .artifact
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("artifact not set in host state"))?;
-            let file = self
-                .file
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("artifact file not open in host state"))?;
-            let start = Instant::now();
-            let bytes = artifact.read_chunk_bytes_by_index_from_file(file, chunk_id)?;
-            self.stats.fetch_time_ns += start.elapsed().as_nanos() as u64;
-            self.stats.chunks_fetched += 1;
-            self.stats.compressed_bytes_in += bytes.len() as u64;
-            if let Some(raw_len) = self.raw_lens.get(chunk_id as usize).copied() {
-                self.stats.raw_bytes_decoded += raw_len;
-            }
-            self.stats.note_chunk(chunk_id, /*miss=*/true);
-            if self.cache_enabled {
-                self.cache.insert(chunk_id, bytes.clone());
-            }
-            bytes
-        };
-
-        if bytes.len() > dst.len() {
-            return Ok(0);
+            return Ok(Arc::clone(buf));
         }
-        dst[..bytes.len()].copy_from_slice(&bytes);
-        Ok(bytes.len() as u32)
+        let artifact = self
+            .artifact
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("artifact not set in host state"))?;
+        let file = self
+            .file
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("artifact file not open in host state"))?;
+        let start = Instant::now();
+        let bytes = artifact.read_chunk_bytes_by_index_from_file(file, chunk_id)?;
+        self.stats.fetch_time_ns += start.elapsed().as_nanos() as u64;
+        self.stats.chunks_fetched += 1;
+        self.stats.compressed_bytes_in += bytes.len() as u64;
+        if let Some(raw_len) = self.raw_lens.get(chunk_id as usize).copied() {
+            self.stats.raw_bytes_decoded += raw_len;
+        }
+        self.stats.note_chunk(chunk_id, /*miss=*/true);
+        let arc: Arc<[u8]> = Arc::from(bytes);
+        if self.cache_enabled {
+            self.cache.insert(chunk_id, Arc::clone(&arc));
+        }
+        Ok(arc)
     }
 }
 
@@ -94,6 +88,7 @@ pub struct FetchStats {
     pub compressed_bytes_in: u64,
     pub raw_bytes_decoded: u64,
     pub fetch_time_ns: u64,
+    pub transfer_time_ns: u64,
     pub total_time_ns: u64,
     pub fetched_chunk_ids_sample: Vec<u32>,
     pub cache_miss_chunk_ids_sample: Vec<u32>,
@@ -118,15 +113,21 @@ pub struct WasmIvfFlatKernel {
     dealloc: TypedFunc<(u32, u32, u32), ()>,
     search_batch: TypedFunc<(u32, u32, u32, u32, u32, u32, u32, u32, u32, u32), u32>,
     set_decoded_cache_budget: Option<TypedFunc<u32, ()>>,
+    set_profile_stages: Option<TypedFunc<u32, ()>>,
     last_stats: Option<TypedFunc<u32, u32>>,
+    last_stats_v2: Option<TypedFunc<u32, u32>>,
     decoded_cache_budget_bytes: u32,
     last_kernel_stats: KernelStats,
+    profile_stages: bool,
 }
 
 #[derive(Debug, Default, Clone)]
 pub struct KernelStats {
     pub decode_time_ns: u64,
     pub compute_time_ns: u64,
+    pub centroid_time_ns: u64,
+    pub dist_time_ns: u64,
+    pub heap_time_ns: u64,
     pub decoded_cache_hits: u64,
     pub decoded_cache_misses: u64,
     pub decoded_cache_bytes: u64,
@@ -158,15 +159,17 @@ impl WasmIvfFlatKernel {
                         .get_export("memory")
                         .and_then(|e| e.into_memory())
                         .ok_or_else(|| anyhow::anyhow!("wasm export `memory` not found"))?;
-                    let mut tmp = vec![0u8; dst_len as usize];
-                    let n = {
+                    let start = Instant::now();
+                    let bytes = {
                         let state = &mut caller.data_mut().host;
-                        state.read_chunk_into(chunk_id, &mut tmp)?
+                        state.get_chunk_bytes(chunk_id)?
                     };
-                    if n == 0 {
+                    let n = u32::try_from(bytes.len()).unwrap_or(0);
+                    if n == 0 || n > dst_len {
                         return Ok(0);
                     }
-                    mem.write(&mut caller, dst_ptr as usize, &tmp[..n as usize])?;
+                    mem.write(&mut caller, dst_ptr as usize, &bytes)?;
+                    caller.data_mut().host.stats.transfer_time_ns += start.elapsed().as_nanos() as u64;
                     Ok(n)
                 })();
                 res.unwrap_or(0)
@@ -207,8 +210,14 @@ impl WasmIvfFlatKernel {
         let set_decoded_cache_budget = instance
             .get_typed_func::<u32, ()>(&mut store, "ivf_set_decoded_cache_budget_ffi")
             .ok();
+        let set_profile_stages = instance
+            .get_typed_func::<u32, ()>(&mut store, "ivf_set_profile_stages_ffi")
+            .ok();
         let last_stats = instance
             .get_typed_func::<u32, u32>(&mut store, "ivf_last_stats_ffi")
+            .ok();
+        let last_stats_v2 = instance
+            .get_typed_func::<u32, u32>(&mut store, "ivf_last_stats_v2_ffi")
             .ok();
 
         Ok(Self {
@@ -218,14 +227,21 @@ impl WasmIvfFlatKernel {
             dealloc,
             search_batch,
             set_decoded_cache_budget,
+            set_profile_stages,
             last_stats,
+            last_stats_v2,
             decoded_cache_budget_bytes: 192 * 1024 * 1024,
             last_kernel_stats: KernelStats::default(),
+            profile_stages: false,
         })
     }
 
     pub fn set_decoded_cache_budget_bytes(&mut self, bytes: u32) {
         self.decoded_cache_budget_bytes = bytes;
+    }
+
+    pub fn set_profile_stages(&mut self, enabled: bool) {
+        self.profile_stages = enabled;
     }
 
     pub fn kernel_stats(&self) -> KernelStats {
@@ -360,6 +376,9 @@ impl WasmIvfFlatKernel {
         if let Some(setter) = &self.set_decoded_cache_budget {
             let _ = setter.call(&mut self.store, self.decoded_cache_budget_bytes);
         }
+        if let Some(setter) = &self.set_profile_stages {
+            let _ = setter.call(&mut self.store, if self.profile_stages { 1 } else { 0 });
+        }
 
         let ok = self.search_batch.call(
             &mut self.store,
@@ -428,7 +447,31 @@ impl WasmIvfFlatKernel {
 
         // Pull kernel-side breakdown stats if available.
         self.last_kernel_stats = KernelStats::default();
-        if let Some(getter) = &self.last_stats {
+        if let Some(getter) = &self.last_stats_v2 {
+            let stats_ptr = self.alloc.call(&mut self.store, (8 * 8, 8))?;
+            if stats_ptr != 0 {
+                if getter.call(&mut self.store, stats_ptr)? != 0 {
+                    let mut buf = vec![0u8; 8 * 8];
+                    self.memory.read(&mut self.store, stats_ptr as usize, &mut buf)?;
+                    let mut words = [0u64; 8];
+                    for i in 0..8 {
+                        let off = i * 8;
+                        words[i] = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
+                    }
+                    self.last_kernel_stats = KernelStats {
+                        centroid_time_ns: words[0],
+                        decode_time_ns: words[1],
+                        dist_time_ns: words[2],
+                        heap_time_ns: words[3],
+                        compute_time_ns: words[4],
+                        decoded_cache_hits: words[5],
+                        decoded_cache_misses: words[6],
+                        decoded_cache_bytes: words[7],
+                    };
+                }
+                let _ = self.dealloc.call(&mut self.store, (stats_ptr, 8 * 8, 8));
+            }
+        } else if let Some(getter) = &self.last_stats {
             let stats_ptr = self.alloc.call(&mut self.store, (5 * 8, 8))?;
             if stats_ptr != 0 {
                 if getter.call(&mut self.store, stats_ptr)? != 0 {
@@ -445,6 +488,7 @@ impl WasmIvfFlatKernel {
                         decoded_cache_hits: words[2],
                         decoded_cache_misses: words[3],
                         decoded_cache_bytes: words[4],
+                        ..KernelStats::default()
                     };
                 }
                 let _ = self.dealloc.call(&mut self.store, (stats_ptr, 5 * 8, 8));

@@ -52,7 +52,19 @@ def summarize_one(path: str) -> Optional[Dict[str, Any]]:
             "compressed_bytes_in",
             "raw_bytes_decoded",
             "fetch_ms",
+            "transfer_ms",
             "kernel_total_ms",
+        ]:
+            if k in last:
+                out[k] = last[k]
+    if last:
+        for k in [
+            "profile_stages",
+            "centroid_ms",
+            "decode_ms",
+            "dist_ms",
+            "heap_ms",
+            "compute_ms",
         ]:
             if k in last:
                 out[k] = last[k]
@@ -80,6 +92,15 @@ def main() -> None:
                 f" chunks_fetched={r.get('chunks_fetched')} cache_hits={r.get('cache_hits')} "
                 f"fetch_ms={float(r.get('fetch_ms', 0.0)):.3f}"
             )
+            if "transfer_ms" in r:
+                extra += f" transfer_ms={float(r.get('transfer_ms', 0.0)):.3f}"
+        if r.get("profile_stages") and "dist_ms" in r:
+            extra += (
+                f" stages(centroid/decode/dist/heap)={float(r.get('centroid_ms', 0.0)):.3f}/"
+                f"{float(r.get('decode_ms', 0.0)):.3f}/"
+                f"{float(r.get('dist_ms', 0.0)):.3f}/"
+                f"{float(r.get('heap_ms', 0.0)):.3f}"
+            )
         print(
             f"{r['case']}: index={r['index_bytes']} "
             f"p50={r['p50_ms']:.3f} p95={r['p95_ms']:.3f} p99={r['p99_ms']:.3f}{extra}"
@@ -88,4 +109,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

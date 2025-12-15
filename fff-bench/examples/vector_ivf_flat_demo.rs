@@ -95,6 +95,10 @@ struct Args {
     #[arg(long, default_value_t = false)]
     json: bool,
 
+    /// Collect per-stage timing breakdown (adds overhead; intended for diagnosis, not peak perf).
+    #[arg(long, default_value_t = false)]
+    profile_stages: bool,
+
     /// Do not print the top-k results (only print stats).
     #[arg(long, default_value_t = false)]
     quiet: bool,
@@ -144,6 +148,7 @@ fn main() -> Result<()> {
                     "posting_codec": args.artifact_posting_codec,
                     "cache_enabled": !args.artifact_wasm_no_cache,
                     "decoded_cache_budget_bytes": args.artifact_wasm_decoded_cache_bytes,
+                    "profile_stages": args.profile_stages,
                 })
             );
         }
@@ -153,6 +158,7 @@ fn main() -> Result<()> {
             .with_context(|| "load wasm ivf-flat kernel")?;
         kernel.set_cache_enabled(!args.artifact_wasm_no_cache);
         kernel.set_decoded_cache_budget_bytes(args.artifact_wasm_decoded_cache_bytes);
+        kernel.set_profile_stages(args.profile_stages);
         let nq = args.nq;
 
         // Warmup
@@ -193,11 +199,16 @@ fn main() -> Result<()> {
                         "posting_codec": args.artifact_posting_codec,
                         "cache_enabled": !args.artifact_wasm_no_cache,
                         "decoded_cache_budget_bytes": args.artifact_wasm_decoded_cache_bytes,
+                        "profile_stages": args.profile_stages,
                         "wall_ms": wall_ms,
                         "kernel_total_ms": (stats.total_time_ns as f64) / 1e6,
                         "fetch_ms": (stats.fetch_time_ns as f64) / 1e6,
+                        "transfer_ms": (stats.transfer_time_ns as f64) / 1e6,
                         "decode_ms": (kstats.decode_time_ns as f64) / 1e6,
                         "compute_ms": (kstats.compute_time_ns as f64) / 1e6,
+                        "centroid_ms": (kstats.centroid_time_ns as f64) / 1e6,
+                        "dist_ms": (kstats.dist_time_ns as f64) / 1e6,
+                        "heap_ms": (kstats.heap_time_ns as f64) / 1e6,
                         "decoded_cache_hits": kstats.decoded_cache_hits,
                         "decoded_cache_misses": kstats.decoded_cache_misses,
                         "decoded_cache_bytes": kstats.decoded_cache_bytes,
@@ -258,6 +269,7 @@ fn main() -> Result<()> {
                     "k": args.k,
                     "nprobe": args.nprobe,
                     "posting_codec": args.artifact_posting_codec,
+                    "profile_stages": args.profile_stages,
                 })
             );
         }
@@ -269,7 +281,11 @@ fn main() -> Result<()> {
             }
             for q in 0..args.nq {
                 let query = &queries[q * args.dim..(q + 1) * args.dim];
-                let _ = searcher.search(query, args.k, args.nprobe)?;
+                if args.profile_stages {
+                    let _ = searcher.search_profiled(query, args.k, args.nprobe)?;
+                } else {
+                    let _ = searcher.search(query, args.k, args.nprobe)?;
+                }
             }
         }
         let mut last = Vec::new();
@@ -278,9 +294,26 @@ fn main() -> Result<()> {
                 searcher.clear_posting_cache();
             }
             let run_start = Instant::now();
+            let mut centroid_ns: u64 = 0;
+            let mut decode_ns: u64 = 0;
+            let mut dist_ns: u64 = 0;
+            let mut heap_ns: u64 = 0;
+            let mut cache_hits: u64 = 0;
+            let mut cache_misses: u64 = 0;
             for q in 0..args.nq {
                 let query = &queries[q * args.dim..(q + 1) * args.dim];
-                last = searcher.search(query, args.k, args.nprobe)?;
+                if args.profile_stages {
+                    let (r, s) = searcher.search_profiled(query, args.k, args.nprobe)?;
+                    last = r;
+                    centroid_ns += s.centroid_ns;
+                    decode_ns += s.posting_decode_ns;
+                    dist_ns += s.dist_ns;
+                    heap_ns += s.heap_ns;
+                    cache_hits += s.posting_cache_hits;
+                    cache_misses += s.posting_cache_misses;
+                } else {
+                    last = searcher.search(query, args.k, args.nprobe)?;
+                }
             }
             let wall_ms = run_start.elapsed().as_secs_f64() * 1000.0;
             if args.json {
@@ -293,7 +326,14 @@ fn main() -> Result<()> {
                         "k": args.k,
                         "nprobe": args.nprobe,
                         "posting_codec": args.artifact_posting_codec,
+                        "profile_stages": args.profile_stages,
                         "wall_ms": wall_ms,
+                        "centroid_ms": (centroid_ns as f64) / 1e6,
+                        "decode_ms": (decode_ns as f64) / 1e6,
+                        "dist_ms": (dist_ns as f64) / 1e6,
+                        "heap_ms": (heap_ns as f64) / 1e6,
+                        "posting_cache_hits": cache_hits,
+                        "posting_cache_misses": cache_misses,
                     })
                 );
             } else {

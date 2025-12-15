@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$root"
+
+sift_dir="${SIFT_DIR:-$root/data/sift}"
+out_dir="${1:-$root/results/sift_ivf_aligned_profile_$(date +%Y%m%d_%H%M%S)}"
+mkdir -p "$out_dir"
+
+echo "[1/4] Ensure SIFT100K + base F3"
+bash "$root/scripts/download_sift_100k.sh" "$sift_dir"
+base_f3="$sift_dir/sift100k.f3"
+if [[ ! -f "$base_f3" ]]; then
+  cargo run -p fff-bench --release --example sift_build_f3 -- \
+    --sift-dir "$sift_dir" --max-vectors 100000 --out "$base_f3"
+fi
+
+echo "[2/4] Build Wasm kernel"
+cargo build -p ivf-kernel-basic --target wasm32-wasip1 --release
+wasm_kernel="$root/target/wasm32-wasip1/release/ivf_kernel_basic.wasm"
+
+echo "[3/4] Run stage-profiled cases -> $out_dir"
+
+common_args=(
+  --base-f3 "$base_f3"
+  --vector-leaf-index 0
+  --dim 128
+  --index-name sift_ivf
+  --nlist 64
+  --train-sample 5000
+  --max-kmeans-iters 5
+  --seed 1
+  --k 10
+  --nprobe 16
+  --nq 32
+  --warmup 2
+  --repeat 5
+  --json
+  --quiet
+  --profile-stages
+)
+
+run_case() {
+  local name="$1"
+  shift
+  local out="$out_dir/$name.jsonl"
+  echo "case: $name -> $out"
+  cargo run -p fff-bench --release --example vector_ivf_flat_demo -- \
+    "${common_args[@]}" "$@" \
+    | tee "$out" >/dev/null
+}
+
+# Stage profiling is for attribution (centroid/decode/dist/heap), not peak performance:
+# it may add overhead by splitting distance vs heap maintenance into separate passes.
+
+# Warm cases (decoded caches enabled)
+run_case "native_f32_warm" --artifact --artifact-posting-codec raw \
+  --artifact-native-decoded-cache=true --artifact-native-clear-each-iter=false
+run_case "wasm_f32_warm" --artifact-wasm-kernel "$wasm_kernel" --artifact-posting-codec raw \
+  --artifact-wasm-decoded-cache-bytes 201326592
+
+run_case "native_f16_warm" --artifact --artifact-posting-codec raw_f16 \
+  --artifact-native-decoded-cache=true --artifact-native-clear-each-iter=false
+run_case "wasm_f16_warm" --artifact-wasm-kernel "$wasm_kernel" --artifact-posting-codec raw_f16 \
+  --artifact-wasm-decoded-cache-bytes 201326592
+
+echo "[4/4] Summaries"
+python3 "$root/scripts/summarize_ivf_jsonl.py" "$out_dir"
+echo "results: $out_dir"
+

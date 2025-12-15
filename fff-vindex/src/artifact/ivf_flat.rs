@@ -12,6 +12,7 @@ use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 use std::sync::OnceLock;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -999,6 +1000,16 @@ pub struct IvfFlatArtifactSearcher {
     posting_cache_enabled: bool,
 }
 
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct IvfFlatSearchStageStats {
+    pub centroid_ns: u64,
+    pub posting_decode_ns: u64,
+    pub dist_ns: u64,
+    pub heap_ns: u64,
+    pub posting_cache_hits: u64,
+    pub posting_cache_misses: u64,
+}
+
 impl IvfFlatArtifactSearcher {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         Self::open_with_options(path, /*posting_cache_enabled=*/true)
@@ -1119,5 +1130,138 @@ impl IvfFlatArtifactSearcher {
             .collect::<Vec<_>>();
         out.sort_by(|a, b| a.distance.total_cmp(&b.distance));
         Ok(out)
+    }
+
+    pub fn search_profiled(
+        &self,
+        query: &[f32],
+        k: usize,
+        nprobe: usize,
+    ) -> Result<(Vec<SearchResult>, IvfFlatSearchStageStats)> {
+        let mut stats = IvfFlatSearchStageStats::default();
+
+        let footer = self.artifact.footer();
+        let dim = footer.dim as usize;
+        let nlist = footer.nlist as usize;
+        if query.len() != dim {
+            bail!("query dim mismatch: expected {dim}, got {}", query.len());
+        }
+        if k == 0 {
+            return Ok((vec![], stats));
+        }
+        let nprobe = nprobe.min(nlist).max(1);
+
+        if self.centroids.len() != nlist * dim {
+            bail!("centroids len mismatch");
+        }
+
+        let start_centroids = Instant::now();
+        let mut centroid_dists: Vec<(usize, f32)> = (0..nlist)
+            .map(|cid| {
+                let c = &self.centroids[cid * dim..(cid + 1) * dim];
+                (cid, crate::ivf_flat::l2_sq(query, c))
+            })
+            .collect();
+        centroid_dists.select_nth_unstable_by(nprobe - 1, |a, b| a.1.total_cmp(&b.1));
+        centroid_dists.truncate(nprobe);
+        stats.centroid_ns += start_centroids.elapsed().as_nanos() as u64;
+
+        let mut heap: std::collections::BinaryHeap<(ordered_float::NotNan<f32>, u32)> =
+            std::collections::BinaryHeap::new();
+        let mut scratch_dists: Vec<f32> = Vec::new();
+
+        for (cid, _) in centroid_dists {
+            let cid_u32 = cid as u32;
+
+            if self.posting_cache_enabled {
+                if self.posting_cache.borrow().contains_key(&cid_u32) {
+                    stats.posting_cache_hits += 1;
+                } else {
+                    stats.posting_cache_misses += 1;
+                    let start_decode = Instant::now();
+                    let decoded = self
+                        .artifact
+                        .read_posting_list_from_file(&self.file, cid_u32)?;
+                    stats.posting_decode_ns += start_decode.elapsed().as_nanos() as u64;
+                    self.posting_cache.borrow_mut().insert(cid_u32, decoded);
+                }
+
+                let cache = self.posting_cache.borrow();
+                let Some((row_ids, vectors)) = cache.get(&cid_u32) else {
+                    continue;
+                };
+
+                scratch_dists.clear();
+                scratch_dists.reserve(row_ids.len());
+                let start_dist = Instant::now();
+                for pos in 0..row_ids.len() {
+                    let start = pos * dim;
+                    let v = &vectors[start..start + dim];
+                    scratch_dists.push(crate::ivf_flat::l2_sq(query, v));
+                }
+                stats.dist_ns += start_dist.elapsed().as_nanos() as u64;
+
+                let start_heap = Instant::now();
+                for (pos, &row_id) in row_ids.iter().enumerate() {
+                    let dist_nn = ordered_float::NotNan::new(scratch_dists[pos])
+                        .map_err(|_| anyhow::anyhow!("distance is NaN"))?;
+                    if heap.len() < k {
+                        heap.push((dist_nn, row_id));
+                    } else if let Some(&(worst, _)) = heap.peek() {
+                        if dist_nn < worst {
+                            heap.pop();
+                            heap.push((dist_nn, row_id));
+                        }
+                    }
+                }
+                stats.heap_ns += start_heap.elapsed().as_nanos() as u64;
+                continue;
+            }
+
+            stats.posting_cache_misses += 1;
+            let start_decode = Instant::now();
+            let decoded = self
+                .artifact
+                .read_posting_list_from_file(&self.file, cid_u32)?;
+            stats.posting_decode_ns += start_decode.elapsed().as_nanos() as u64;
+
+            let (row_ids, vectors) = decoded;
+
+            scratch_dists.clear();
+            scratch_dists.reserve(row_ids.len());
+            let start_dist = Instant::now();
+            for pos in 0..row_ids.len() {
+                let start = pos * dim;
+                let v = &vectors[start..start + dim];
+                scratch_dists.push(crate::ivf_flat::l2_sq(query, v));
+            }
+            stats.dist_ns += start_dist.elapsed().as_nanos() as u64;
+
+            let start_heap = Instant::now();
+            for (pos, &row_id) in row_ids.iter().enumerate() {
+                let dist_nn = ordered_float::NotNan::new(scratch_dists[pos])
+                    .map_err(|_| anyhow::anyhow!("distance is NaN"))?;
+                if heap.len() < k {
+                    heap.push((dist_nn, row_id));
+                } else if let Some(&(worst, _)) = heap.peek() {
+                    if dist_nn < worst {
+                        heap.pop();
+                        heap.push((dist_nn, row_id));
+                    }
+                }
+            }
+            stats.heap_ns += start_heap.elapsed().as_nanos() as u64;
+        }
+
+        let mut out = heap
+            .into_sorted_vec()
+            .into_iter()
+            .map(|(distance, row_id)| SearchResult {
+                row_id,
+                distance: distance.into_inner(),
+            })
+            .collect::<Vec<_>>();
+        out.sort_by(|a, b| a.distance.total_cmp(&b.distance));
+        Ok((out, stats))
     }
 }

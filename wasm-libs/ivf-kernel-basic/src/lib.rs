@@ -109,8 +109,11 @@ fn decoded_cache() -> &'static Mutex<DecodedCache> {
 
 #[derive(Default, Clone, Copy)]
 struct LastStats {
+    centroid_ns: u64,
     decode_ns: u64,
     compute_ns: u64,
+    dist_ns: u64,
+    heap_ns: u64,
     decoded_cache_hits: u64,
     decoded_cache_misses: u64,
     decoded_cache_bytes: u64,
@@ -121,9 +124,23 @@ fn last_stats_cell() -> &'static Mutex<LastStats> {
     STATS.get_or_init(|| Mutex::new(LastStats::default()))
 }
 
+fn profile_stages_cell() -> &'static Mutex<bool> {
+    static PROFILE: OnceLock<Mutex<bool>> = OnceLock::new();
+    PROFILE.get_or_init(|| Mutex::new(false))
+}
+
+fn profile_stages_enabled() -> bool {
+    *profile_stages_cell().lock().unwrap()
+}
+
 #[no_mangle]
 pub extern "C" fn ivf_set_decoded_cache_budget_ffi(bytes: u32) {
     decoded_cache().lock().unwrap().set_budget(bytes as usize);
+}
+
+#[no_mangle]
+pub extern "C" fn ivf_set_profile_stages_ffi(enabled: u32) {
+    *profile_stages_cell().lock().unwrap() = enabled != 0;
 }
 
 /// Writes 5x u64 to `out_ptr`:
@@ -140,6 +157,26 @@ pub unsafe extern "C" fn ivf_last_stats_ffi(out_ptr: u32) -> u32 {
     out[2] = s.decoded_cache_hits;
     out[3] = s.decoded_cache_misses;
     out[4] = s.decoded_cache_bytes;
+    1
+}
+
+/// Writes 8x u64 to `out_ptr`:
+/// - centroid_ns, decode_ns, dist_ns, heap_ns, compute_ns, decoded_cache_hits, decoded_cache_misses, decoded_cache_bytes
+#[no_mangle]
+pub unsafe extern "C" fn ivf_last_stats_v2_ffi(out_ptr: u32) -> u32 {
+    if out_ptr == 0 {
+        return 0;
+    }
+    let s = *last_stats_cell().lock().unwrap();
+    let out = std::slice::from_raw_parts_mut(out_ptr as *mut u64, 8);
+    out[0] = s.centroid_ns;
+    out[1] = s.decode_ns;
+    out[2] = s.dist_ns;
+    out[3] = s.heap_ns;
+    out[4] = s.compute_ns;
+    out[5] = s.decoded_cache_hits;
+    out[6] = s.decoded_cache_misses;
+    out[7] = s.decoded_cache_bytes;
     1
 }
 
@@ -679,14 +716,22 @@ pub unsafe extern "C" fn ivf_flat_search_batch_ffi(
     let out_cap = out_cap as usize;
     let k = (k.min(out_cap as u32)) as usize;
 
+    let profile = profile_stages_enabled();
     let mut decode_ns: u64 = 0;
     let mut compute_ns: u64 = 0;
+    let mut centroid_ns: u64 = 0;
+    let mut dist_ns: u64 = 0;
+    let mut heap_ns: u64 = 0;
     let mut decoded_cache_hits: u64 = 0;
     let mut decoded_cache_misses: u64 = 0;
 
     for q in 0..(nq as usize) {
         let query = &queries[q * dim as usize..(q + 1) * dim as usize];
 
+        let mut scratch_dists = Vec::<f32>::new();
+        let mut scratch_row_ids = Vec::<u32>::new();
+
+        let start_centroids = if profile { Some(Instant::now()) } else { None };
         let mut centroid_dists = Vec::<(u32, f32)>::with_capacity(nlist as usize);
         for cid in 0..nlist as usize {
             let c = &centroids[cid * dim as usize..(cid + 1) * dim as usize];
@@ -695,6 +740,9 @@ pub unsafe extern "C" fn ivf_flat_search_batch_ffi(
         let nprobe = nprobe.clamp(1, nlist);
         centroid_dists.select_nth_unstable_by((nprobe - 1) as usize, |a, b| a.1.total_cmp(&b.1));
         centroid_dists.truncate(nprobe as usize);
+        if let Some(start) = start_centroids {
+            centroid_ns += start.elapsed().as_nanos() as u64;
+        }
 
         let mut heap = std::collections::BinaryHeap::<Pair>::new();
 
@@ -708,12 +756,30 @@ pub unsafe extern "C" fn ivf_flat_search_batch_ffi(
             if posting_codec == 2 || posting_codec == 3 {
                 if let Some(posting) = decoded_cache().lock().unwrap().get(posting_chunk_id) {
                     decoded_cache_hits += 1;
-                    let start_compute = Instant::now();
-                    for (pos, &row_id) in posting.row_ids.iter().enumerate() {
-                        let v = &posting.vectors[pos * dim as usize..(pos + 1) * dim as usize];
-                        heap_push_topk(&mut heap, k, row_id, l2_sq(query, v));
+                    if profile {
+                        scratch_dists.clear();
+                        scratch_dists.reserve(posting.row_ids.len());
+                        let start_dist = Instant::now();
+                        for pos in 0..posting.row_ids.len() {
+                            let v = &posting.vectors[pos * dim as usize..(pos + 1) * dim as usize];
+                            scratch_dists.push(l2_sq(query, v));
+                        }
+                        dist_ns += start_dist.elapsed().as_nanos() as u64;
+
+                        let start_heap = Instant::now();
+                        for (pos, &row_id) in posting.row_ids.iter().enumerate() {
+                            heap_push_topk(&mut heap, k, row_id, scratch_dists[pos]);
+                        }
+                        heap_ns += start_heap.elapsed().as_nanos() as u64;
+                    } else {
+                        let start_compute = Instant::now();
+                        for (pos, &row_id) in posting.row_ids.iter().enumerate() {
+                            let v =
+                                &posting.vectors[pos * dim as usize..(pos + 1) * dim as usize];
+                            heap_push_topk(&mut heap, k, row_id, l2_sq(query, v));
+                        }
+                        compute_ns += start_compute.elapsed().as_nanos() as u64;
                     }
-                    compute_ns += start_compute.elapsed().as_nanos() as u64;
                     continue;
                 }
                 decoded_cache_misses += 1;
@@ -729,12 +795,29 @@ pub unsafe extern "C" fn ivf_flat_search_batch_ffi(
                 };
                 decode_ns += start_decode.elapsed().as_nanos() as u64;
                 let Some(decoded) = decoded else { continue; };
-                let start_compute = Instant::now();
-                for (pos, &row_id) in decoded.row_ids.iter().enumerate() {
-                    let v = &decoded.vectors[pos * dim as usize..(pos + 1) * dim as usize];
-                    heap_push_topk(&mut heap, k, row_id, l2_sq(query, v));
+                if profile {
+                    scratch_dists.clear();
+                    scratch_dists.reserve(decoded.row_ids.len());
+                    let start_dist = Instant::now();
+                    for pos in 0..decoded.row_ids.len() {
+                        let v = &decoded.vectors[pos * dim as usize..(pos + 1) * dim as usize];
+                        scratch_dists.push(l2_sq(query, v));
+                    }
+                    dist_ns += start_dist.elapsed().as_nanos() as u64;
+
+                    let start_heap = Instant::now();
+                    for (pos, &row_id) in decoded.row_ids.iter().enumerate() {
+                        heap_push_topk(&mut heap, k, row_id, scratch_dists[pos]);
+                    }
+                    heap_ns += start_heap.elapsed().as_nanos() as u64;
+                } else {
+                    let start_compute = Instant::now();
+                    for (pos, &row_id) in decoded.row_ids.iter().enumerate() {
+                        let v = &decoded.vectors[pos * dim as usize..(pos + 1) * dim as usize];
+                        heap_push_topk(&mut heap, k, row_id, l2_sq(query, v));
+                    }
+                    compute_ns += start_compute.elapsed().as_nanos() as u64;
                 }
-                compute_ns += start_compute.elapsed().as_nanos() as u64;
                 decoded_cache().lock().unwrap().insert(posting_chunk_id, decoded);
                 continue;
             }
@@ -764,12 +847,29 @@ pub unsafe extern "C" fn ivf_flat_search_batch_ffi(
                         bytes[row_ids_bytes..].as_ptr() as *const f32,
                         count * dim as usize,
                     );
-                    let start_compute = Instant::now();
-                    for (pos, &row_id) in row_ids.iter().enumerate() {
-                        let v = &vectors[pos * dim as usize..(pos + 1) * dim as usize];
-                        heap_push_topk(&mut heap, k, row_id, l2_sq(query, v));
+                    if profile {
+                        scratch_dists.clear();
+                        scratch_dists.reserve(row_ids.len());
+                        let start_dist = Instant::now();
+                        for pos in 0..row_ids.len() {
+                            let v = &vectors[pos * dim as usize..(pos + 1) * dim as usize];
+                            scratch_dists.push(l2_sq(query, v));
+                        }
+                        dist_ns += start_dist.elapsed().as_nanos() as u64;
+
+                        let start_heap = Instant::now();
+                        for (pos, &row_id) in row_ids.iter().enumerate() {
+                            heap_push_topk(&mut heap, k, row_id, scratch_dists[pos]);
+                        }
+                        heap_ns += start_heap.elapsed().as_nanos() as u64;
+                    } else {
+                        let start_compute = Instant::now();
+                        for (pos, &row_id) in row_ids.iter().enumerate() {
+                            let v = &vectors[pos * dim as usize..(pos + 1) * dim as usize];
+                            heap_push_topk(&mut heap, k, row_id, l2_sq(query, v));
+                        }
+                        compute_ns += start_compute.elapsed().as_nanos() as u64;
                     }
-                    compute_ns += start_compute.elapsed().as_nanos() as u64;
                 }
                 1 => {
                     if bytes.len() < 8 {
@@ -796,21 +896,55 @@ pub unsafe extern "C" fn ivf_flat_search_batch_ffi(
                         count * dim as usize,
                     );
 
-                    let mut cur_row = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
-                    let mut off2 = 8usize;
-                    let start_compute = Instant::now();
-                    for pos in 0..count {
-                        if pos > 0 {
-                            let Some((delta, used)) = decode_uleb128_u32(&bytes[off2..]) else {
-                                break;
-                            };
-                            off2 += used;
-                            cur_row = cur_row.wrapping_add(delta);
+                    if profile {
+                        scratch_row_ids.clear();
+                        scratch_row_ids.reserve(count);
+                        let start_decode = Instant::now();
+                        let mut cur_row = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+                        let mut off2 = 8usize;
+                        for pos in 0..count {
+                            if pos > 0 {
+                                let Some((delta, used)) = decode_uleb128_u32(&bytes[off2..]) else {
+                                    break;
+                                };
+                                off2 += used;
+                                cur_row = cur_row.wrapping_add(delta);
+                            }
+                            scratch_row_ids.push(cur_row);
                         }
-                        let v = &vectors[pos * dim as usize..(pos + 1) * dim as usize];
-                        heap_push_topk(&mut heap, k, cur_row, l2_sq(query, v));
+                        decode_ns += start_decode.elapsed().as_nanos() as u64;
+
+                        scratch_dists.clear();
+                        scratch_dists.reserve(scratch_row_ids.len());
+                        let start_dist = Instant::now();
+                        for pos in 0..scratch_row_ids.len() {
+                            let v = &vectors[pos * dim as usize..(pos + 1) * dim as usize];
+                            scratch_dists.push(l2_sq(query, v));
+                        }
+                        dist_ns += start_dist.elapsed().as_nanos() as u64;
+
+                        let start_heap = Instant::now();
+                        for (pos, &row_id) in scratch_row_ids.iter().enumerate() {
+                            heap_push_topk(&mut heap, k, row_id, scratch_dists[pos]);
+                        }
+                        heap_ns += start_heap.elapsed().as_nanos() as u64;
+                    } else {
+                        let mut cur_row = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+                        let mut off2 = 8usize;
+                        let start_compute = Instant::now();
+                        for pos in 0..count {
+                            if pos > 0 {
+                                let Some((delta, used)) = decode_uleb128_u32(&bytes[off2..]) else {
+                                    break;
+                                };
+                                off2 += used;
+                                cur_row = cur_row.wrapping_add(delta);
+                            }
+                            let v = &vectors[pos * dim as usize..(pos + 1) * dim as usize];
+                            heap_push_topk(&mut heap, k, cur_row, l2_sq(query, v));
+                        }
+                        compute_ns += start_compute.elapsed().as_nanos() as u64;
                     }
-                    compute_ns += start_compute.elapsed().as_nanos() as u64;
                 }
                 2 => {
                     let row_ids_bytes = 4 + count * 4;
@@ -822,13 +956,31 @@ pub unsafe extern "C" fn ivf_flat_search_batch_ffi(
                         count,
                     );
                     let vectors_bytes = &bytes[row_ids_bytes..];
-                    let start_compute = Instant::now();
-                    for (pos, &row_id) in row_ids.iter().enumerate() {
-                        let off = pos * dim as usize * 2;
-                        let v = &vectors_bytes[off..off + dim as usize * 2];
-                        heap_push_topk(&mut heap, k, row_id, l2_sq_f16(query, v));
+                    if profile {
+                        scratch_dists.clear();
+                        scratch_dists.reserve(row_ids.len());
+                        let start_dist = Instant::now();
+                        for pos in 0..row_ids.len() {
+                            let off = pos * dim as usize * 2;
+                            let v = &vectors_bytes[off..off + dim as usize * 2];
+                            scratch_dists.push(l2_sq_f16(query, v));
+                        }
+                        dist_ns += start_dist.elapsed().as_nanos() as u64;
+
+                        let start_heap = Instant::now();
+                        for (pos, &row_id) in row_ids.iter().enumerate() {
+                            heap_push_topk(&mut heap, k, row_id, scratch_dists[pos]);
+                        }
+                        heap_ns += start_heap.elapsed().as_nanos() as u64;
+                    } else {
+                        let start_compute = Instant::now();
+                        for (pos, &row_id) in row_ids.iter().enumerate() {
+                            let off = pos * dim as usize * 2;
+                            let v = &vectors_bytes[off..off + dim as usize * 2];
+                            heap_push_topk(&mut heap, k, row_id, l2_sq_f16(query, v));
+                        }
+                        compute_ns += start_compute.elapsed().as_nanos() as u64;
                     }
-                    compute_ns += start_compute.elapsed().as_nanos() as u64;
                 }
                 3 => {
                     if bytes.len() < 8 {
@@ -854,20 +1006,53 @@ pub unsafe extern "C" fn ivf_flat_search_batch_ffi(
 
                     let mut cur_row = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
                     let mut off2 = 8usize;
-                    let start_compute = Instant::now();
-                    for pos in 0..count {
-                        if pos > 0 {
-                            let Some((delta, used)) = decode_uleb128_u32(&bytes[off2..]) else {
-                                break;
-                            };
-                            off2 += used;
-                            cur_row = cur_row.wrapping_add(delta);
+                    if profile {
+                        scratch_row_ids.clear();
+                        scratch_row_ids.reserve(count);
+                        scratch_dists.clear();
+                        scratch_dists.reserve(count);
+                        let start_decode = Instant::now();
+                        for pos in 0..count {
+                            if pos > 0 {
+                                let Some((delta, used)) = decode_uleb128_u32(&bytes[off2..]) else {
+                                    break;
+                                };
+                                off2 += used;
+                                cur_row = cur_row.wrapping_add(delta);
+                            }
+                            scratch_row_ids.push(cur_row);
                         }
-                        let off = pos * dim as usize * 2;
-                        let v = &vectors_bytes[off..off + dim as usize * 2];
-                        heap_push_topk(&mut heap, k, cur_row, l2_sq_f16(query, v));
+                        decode_ns += start_decode.elapsed().as_nanos() as u64;
+
+                        let start_dist = Instant::now();
+                        for pos in 0..scratch_row_ids.len() {
+                            let off = pos * dim as usize * 2;
+                            let v = &vectors_bytes[off..off + dim as usize * 2];
+                            scratch_dists.push(l2_sq_f16(query, v));
+                        }
+                        dist_ns += start_dist.elapsed().as_nanos() as u64;
+
+                        let start_heap = Instant::now();
+                        for (pos, &row_id) in scratch_row_ids.iter().enumerate() {
+                            heap_push_topk(&mut heap, k, row_id, scratch_dists[pos]);
+                        }
+                        heap_ns += start_heap.elapsed().as_nanos() as u64;
+                    } else {
+                        let start_compute = Instant::now();
+                        for pos in 0..count {
+                            if pos > 0 {
+                                let Some((delta, used)) = decode_uleb128_u32(&bytes[off2..]) else {
+                                    break;
+                                };
+                                off2 += used;
+                                cur_row = cur_row.wrapping_add(delta);
+                            }
+                            let off = pos * dim as usize * 2;
+                            let v = &vectors_bytes[off..off + dim as usize * 2];
+                            heap_push_topk(&mut heap, k, cur_row, l2_sq_f16(query, v));
+                        }
+                        compute_ns += start_compute.elapsed().as_nanos() as u64;
                     }
-                    compute_ns += start_compute.elapsed().as_nanos() as u64;
                 }
                 _ => continue,
             }
@@ -878,9 +1063,15 @@ pub unsafe extern "C" fn ivf_flat_search_batch_ffi(
     }
 
     let cache_bytes = decoded_cache().lock().unwrap().bytes as u64;
+    if profile {
+        compute_ns = dist_ns.saturating_add(heap_ns);
+    }
     *last_stats_cell().lock().unwrap() = LastStats {
+        centroid_ns,
         decode_ns,
         compute_ns,
+        dist_ns,
+        heap_ns,
         decoded_cache_hits,
         decoded_cache_misses,
         decoded_cache_bytes: cache_bytes,

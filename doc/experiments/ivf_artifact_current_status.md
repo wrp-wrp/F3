@@ -81,12 +81,14 @@ Wasm 内核提供 batch API（一次传 `nq>1` 个 query），可以扫 `nq` 看
 
 Wasm 的每次迭代 JSON 行现在包含这些字段（来自 `vector_ivf_flat_demo`）：
 - `fetch_ms`：host 拉 chunk 的耗时（I/O）
+- `transfer_ms`：host 将 chunk 传入 Wasm 线性内存的耗时（包括 cache hit 时的拷贝/写入）
 - `decode_ms`：Wasm 内核里 posting 解码耗时（主要用于 `*_f16` 的动态解压/解码）
 - `compute_ms`：Wasm 内核里遍历 posting + 距离计算（扫描阶段）的耗时
 - `kernel_total_ms`：Wasm 内核总耗时（包含 centroid 距离、heap/topk、扫描等所有内核工作）
 
 因此，在 **host cache 开启** 且 **kernel decoded cache 开启** 的 warm 场景下，如果观测到：
 - `fetch_ms≈0`
+- `transfer_ms≈0`
 - `decode_ms≈0`
 而 `kernel_total_ms` 仍显著大于 0，则剩余时间只能来自 **内核计算**（centroid 选择/heap/topk/距离扫描等）。
 
@@ -95,6 +97,17 @@ Wasm 的每次迭代 JSON 行现在包含这些字段（来自 `vector_ivf_flat_
 - `compute_ms≈47.7ms`，`kernel_total_ms≈47.9ms`
 
 这说明在 warm 情况下，“动态解压”已经不再是瓶颈，差距主要来自计算（尤其是 posting 扫描 + 距离核）。
+
+### Stage profiling（native vs wasm：centroid/decode/dist/heap）
+
+为了把 “遍历索引 / 距离计算 / topk(heap)” 的时间拆开做归因，`vector_ivf_flat_demo` 增加了 `--profile-stages`：
+- native artifact：通过 `IvfFlatArtifactSearcher::search_profiled()` 输出 `centroid_ms / decode_ms / dist_ms / heap_ms`
+- wasm artifact：kernel 侧通过 `ivf_last_stats_v2_ffi` 输出同名字段；host 侧仍输出 `fetch_ms / transfer_ms`
+
+脚本：`bash scripts/run_sift_ivf_aligned_profile.sh`  
+本地结果目录（一次样例）：`results/sift_ivf_aligned_profile_20251216_001400/`
+
+> 注意：stage profiling 会把距离计算与 heap 更新拆成多 pass，会额外引入开销；它的用途是“时间归因”，不是“峰值性能”。
 
 ### SIMD 公平性（论文里应该怎么做）
 
@@ -111,7 +124,7 @@ Wasm 的每次迭代 JSON 行现在包含这些字段（来自 `vector_ivf_flat_
 为避免“native 热、wasm 冷”或缓存策略不一致，提供了严格对齐脚本：
 
 - 运行：`bash scripts/run_sift_ivf_aligned.sh`
-- 本地结果目录（一次样例）：`results/sift_ivf_aligned_20251215_234858/`
+- 本地结果目录（一次样例）：`results/sift_ivf_aligned_20251216_001446/`
 
 该脚本固定 `nq=32, nlist=64, nprobe=16, k=10`，并对 `f32/raw` 与 `f16/raw_f16` 各自跑：
 - `native warm`：native decoded posting cache 开
@@ -119,11 +132,11 @@ Wasm 的每次迭代 JSON 行现在包含这些字段（来自 `vector_ivf_flat_
 - `wasm warm`：host chunk cache 开 + wasm kernel decoded cache 开（对 f16）
 - `wasm cold`：host chunk cache 关 + wasm kernel decoded cache 关（对 f16）
 
-一轮汇总（p50 wall_ms，见 `results/sift_ivf_aligned_20251215_234858/`）：
-- `native_f32_warm ≈ 28.458ms`，`native_f32_cold ≈ 63.979ms`
-- `wasm_f32_warm ≈ 84.403ms`，`wasm_f32_cold ≈ 98.482ms`
-- `native_f16_warm ≈ 29.250ms`，`native_f16_cold ≈ 106.432ms`
-- `wasm_f16_warm ≈ 49.497ms`，`wasm_f16_cold ≈ 168.798ms`
+一轮汇总（p50 wall_ms，见 `results/sift_ivf_aligned_20251216_001446/`）：
+- `native_f32_warm ≈ 27.616ms`，`native_f32_cold ≈ 59.186ms`
+- `wasm_f32_warm ≈ 57.634ms`，`wasm_f32_cold ≈ 89.745ms`
+- `native_f16_warm ≈ 28.177ms`，`native_f16_cold ≈ 102.289ms`
+- `wasm_f16_warm ≈ 50.215ms`，`wasm_f16_cold ≈ 158.466ms`
 
 
 ### Size 拆分（同一份 index 文件）

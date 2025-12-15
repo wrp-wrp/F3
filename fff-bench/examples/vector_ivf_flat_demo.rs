@@ -60,6 +60,10 @@ struct Args {
     /// Posting codec for artifact: `raw` or `row_id_delta_varint_v1`.
     #[arg(long, default_value = "raw")]
     artifact_posting_codec: String,
+
+    /// Disable host-side chunk cache for wasm kernel (forces reads each time).
+    #[arg(long, default_value_t = false)]
+    artifact_wasm_no_cache: bool,
 }
 
 fn main() -> Result<()> {
@@ -93,12 +97,26 @@ fn main() -> Result<()> {
         let artifact = Arc::new(artifact);
         let mut kernel = WasmIvfFlatKernel::load(wasm_path, Arc::clone(&artifact))
             .with_context(|| "load wasm ivf-flat kernel")?;
+        kernel.set_cache_enabled(!args.artifact_wasm_no_cache);
         kernel.reset_stats();
         let results = kernel.search(&artifact, &query, args.k, args.nprobe)?;
         let stats = kernel.stats();
         println!(
-            "wasm stats: chunks_fetched={} compressed_bytes_in={} raw_bytes_decoded={}",
-            stats.chunks_fetched, stats.compressed_bytes_in, stats.raw_bytes_decoded
+            "wasm stats: cache_hits={} chunks_fetched={} compressed_bytes_in={} raw_bytes_decoded={} fetch_time_ms={:.3} total_time_ms={:.3}",
+            stats.cache_hits,
+            stats.chunks_fetched,
+            stats.compressed_bytes_in,
+            stats.raw_bytes_decoded,
+            (stats.fetch_time_ns as f64) / 1e6,
+            (stats.total_time_ns as f64) / 1e6,
+        );
+        println!(
+            "wasm chunks(sample): {:?}",
+            stats.fetched_chunk_ids_sample
+        );
+        println!(
+            "wasm chunks(miss sample): {:?}",
+            stats.cache_miss_chunk_ids_sample
         );
         (index_path, results)
     } else if args.artifact {

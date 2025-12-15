@@ -4,14 +4,17 @@ use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 use wasmtime::{Caller, Engine, Linker, Memory, Module, Store, TypedFunc};
 
 #[derive(Default)]
 struct HostState {
     artifact: Option<Arc<IvfFlatArtifact>>,
     cache: HashMap<u32, Vec<u8>>,
+    pending: HashMap<u32, Vec<u8>>,
     raw_lens: Vec<u64>,
     stats: FetchStats,
+    cache_enabled: bool,
 }
 
 impl HostState {
@@ -19,33 +22,100 @@ impl HostState {
         self.raw_lens = artifact.footer().chunks.iter().map(|c| c.raw_len).collect();
         self.artifact = Some(artifact);
         self.cache.clear();
+        self.pending.clear();
         self.stats = FetchStats::default();
+        self.cache_enabled = true;
     }
 
-    fn get_or_load(&mut self, chunk_id: u32) -> Result<&[u8]> {
-        if self.cache.contains_key(&chunk_id) {
-            return Ok(self.cache.get(&chunk_id).unwrap().as_slice());
+    fn chunk_len(&mut self, chunk_id: u32) -> Result<u32> {
+        if let Some(buf) = self.cache.get(&chunk_id) {
+            self.stats.cache_hits += 1;
+            self.stats.note_chunk(chunk_id, /*miss=*/false);
+            return Ok(u32::try_from(buf.len()).unwrap_or(0));
+        }
+        if let Some(buf) = self.pending.get(&chunk_id) {
+            self.stats.note_chunk(chunk_id, /*miss=*/false);
+            return Ok(u32::try_from(buf.len()).unwrap_or(0));
         }
         let artifact = self
             .artifact
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("artifact not set in host state"))?;
+        let start = Instant::now();
         let bytes = artifact.read_chunk_bytes_by_index(chunk_id)?;
+        self.stats.fetch_time_ns += start.elapsed().as_nanos() as u64;
         self.stats.chunks_fetched += 1;
         self.stats.compressed_bytes_in += bytes.len() as u64;
         if let Some(raw_len) = self.raw_lens.get(chunk_id as usize).copied() {
             self.stats.raw_bytes_decoded += raw_len;
         }
-        self.cache.insert(chunk_id, bytes);
-        Ok(self.cache.get(&chunk_id).unwrap().as_slice())
+        self.stats.note_chunk(chunk_id, /*miss=*/true);
+        if self.cache_enabled {
+            self.cache.insert(chunk_id, bytes);
+            Ok(u32::try_from(self.cache[&chunk_id].len()).unwrap_or(0))
+        } else {
+            self.pending.insert(chunk_id, bytes);
+            Ok(u32::try_from(self.pending[&chunk_id].len()).unwrap_or(0))
+        }
+    }
+
+    fn read_chunk_into(&mut self, chunk_id: u32, dst: &mut [u8]) -> Result<u32> {
+        let mut bytes = if let Some(buf) = self.cache.get(&chunk_id) {
+            self.stats.cache_hits += 1;
+            self.stats.note_chunk(chunk_id, /*miss=*/false);
+            buf.clone()
+        } else if let Some(buf) = self.pending.remove(&chunk_id) {
+            self.stats.note_chunk(chunk_id, /*miss=*/false);
+            buf
+        } else {
+            // Fallback: load on-demand (should be rare because wasm calls host_chunk_len first).
+            let len = self.chunk_len(chunk_id)?;
+            if len == 0 {
+                return Ok(0);
+            }
+            if let Some(buf) = self.cache.get(&chunk_id) {
+                buf.clone()
+            } else if let Some(buf) = self.pending.remove(&chunk_id) {
+                buf
+            } else {
+                return Ok(0);
+            }
+        };
+
+        if bytes.len() > dst.len() {
+            return Ok(0);
+        }
+        dst[..bytes.len()].copy_from_slice(&bytes);
+        let n = bytes.len() as u32;
+        if self.cache_enabled && !self.cache.contains_key(&chunk_id) {
+            self.cache.insert(chunk_id, std::mem::take(&mut bytes));
+        }
+        Ok(n)
     }
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub struct FetchStats {
+    pub cache_hits: u64,
     pub chunks_fetched: u64,
     pub compressed_bytes_in: u64,
     pub raw_bytes_decoded: u64,
+    pub fetch_time_ns: u64,
+    pub total_time_ns: u64,
+    pub fetched_chunk_ids_sample: Vec<u32>,
+    pub cache_miss_chunk_ids_sample: Vec<u32>,
+}
+
+impl FetchStats {
+    fn note_chunk(&mut self, chunk_id: u32, miss: bool) {
+        const LIMIT: usize = 64;
+        if self.fetched_chunk_ids_sample.len() < LIMIT {
+            self.fetched_chunk_ids_sample.push(chunk_id);
+        }
+        if miss && self.cache_miss_chunk_ids_sample.len() < LIMIT {
+            self.cache_miss_chunk_ids_sample.push(chunk_id);
+        }
+    }
 }
 
 pub struct WasmIvfFlatKernel {
@@ -66,8 +136,8 @@ impl WasmIvfFlatKernel {
 
         linker.func_wrap("env", "host_chunk_len", |mut caller: Caller<'_, HostState>, chunk_id: u32| -> u32 {
             let state = caller.data_mut();
-            match state.get_or_load(chunk_id) {
-                Ok(bytes) => u32::try_from(bytes.len()).unwrap_or(0),
+            match state.chunk_len(chunk_id) {
+                Ok(len) => len,
                 Err(_) => 0,
             }
         })?;
@@ -77,19 +147,20 @@ impl WasmIvfFlatKernel {
             "host_read_chunk",
             |mut caller: Caller<'_, HostState>, chunk_id: u32, dst_ptr: u32, dst_len: u32| -> u32 {
                 let res: Result<u32> = (|| {
-                    let bytes = {
-                        let state = caller.data_mut();
-                        state.get_or_load(chunk_id)?.to_vec()
-                    };
-                    if bytes.len() > (dst_len as usize) {
-                        return Ok(0);
-                    }
                     let mem = caller
                         .get_export("memory")
                         .and_then(|e| e.into_memory())
                         .ok_or_else(|| anyhow::anyhow!("wasm export `memory` not found"))?;
-                    mem.write(&mut caller, dst_ptr as usize, &bytes)?;
-                    Ok(bytes.len() as u32)
+                    let mut tmp = vec![0u8; dst_len as usize];
+                    let n = {
+                        let state = caller.data_mut();
+                        state.read_chunk_into(chunk_id, &mut tmp)?
+                    };
+                    if n == 0 {
+                        return Ok(0);
+                    }
+                    mem.write(&mut caller, dst_ptr as usize, &tmp[..n as usize])?;
+                    Ok(n)
                 })();
                 res.unwrap_or(0)
             },
@@ -132,8 +203,15 @@ impl WasmIvfFlatKernel {
         self.store.data_mut().stats = FetchStats::default();
     }
 
+    pub fn set_cache_enabled(&mut self, enabled: bool) {
+        self.store.data_mut().cache_enabled = enabled;
+        if !enabled {
+            self.store.data_mut().cache.clear();
+        }
+    }
+
     pub fn stats(&self) -> FetchStats {
-        self.store.data().stats
+        self.store.data().stats.clone()
     }
 
     pub fn search(
@@ -212,6 +290,7 @@ impl WasmIvfFlatKernel {
         }
 
         let nprobe = (nprobe.min(nlist).max(1)) as u32;
+        let start_total = Instant::now();
         let out_n = self.search.call(
             &mut self.store,
             (
@@ -225,6 +304,7 @@ impl WasmIvfFlatKernel {
                 out_cap,
             ),
         )?;
+        let total_time_ns = start_total.elapsed().as_nanos() as u64;
 
         // Read results back.
         let out_bytes = self
@@ -250,6 +330,9 @@ impl WasmIvfFlatKernel {
             .call(&mut self.store, (query_ptr, query_bytes.len() as u32, 4))?;
         self.dealloc
             .call(&mut self.store, (out_ptr, out_len_bytes as u32, 8))?;
+
+        // Record total wall time of the last search.
+        self.store.data_mut().stats.total_time_ns = total_time_ns;
 
         Ok(results)
     }

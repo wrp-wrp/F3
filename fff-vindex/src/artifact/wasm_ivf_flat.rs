@@ -117,6 +117,19 @@ pub struct WasmIvfFlatKernel {
     alloc: TypedFunc<(u32, u32), u32>,
     dealloc: TypedFunc<(u32, u32, u32), ()>,
     search_batch: TypedFunc<(u32, u32, u32, u32, u32, u32, u32, u32, u32, u32), u32>,
+    set_decoded_cache_budget: Option<TypedFunc<u32, ()>>,
+    last_stats: Option<TypedFunc<u32, u32>>,
+    decoded_cache_budget_bytes: u32,
+    last_kernel_stats: KernelStats,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct KernelStats {
+    pub decode_time_ns: u64,
+    pub compute_time_ns: u64,
+    pub decoded_cache_hits: u64,
+    pub decoded_cache_misses: u64,
+    pub decoded_cache_bytes: u64,
 }
 
 impl WasmIvfFlatKernel {
@@ -191,13 +204,32 @@ impl WasmIvfFlatKernel {
             )
             .with_context(|| "get export ivf_flat_search_batch_ffi")?;
 
+        let set_decoded_cache_budget = instance
+            .get_typed_func::<u32, ()>(&mut store, "ivf_set_decoded_cache_budget_ffi")
+            .ok();
+        let last_stats = instance
+            .get_typed_func::<u32, u32>(&mut store, "ivf_last_stats_ffi")
+            .ok();
+
         Ok(Self {
             store,
             memory,
             alloc,
             dealloc,
             search_batch,
+            set_decoded_cache_budget,
+            last_stats,
+            decoded_cache_budget_bytes: 192 * 1024 * 1024,
+            last_kernel_stats: KernelStats::default(),
         })
+    }
+
+    pub fn set_decoded_cache_budget_bytes(&mut self, bytes: u32) {
+        self.decoded_cache_budget_bytes = bytes;
+    }
+
+    pub fn kernel_stats(&self) -> KernelStats {
+        self.last_kernel_stats.clone()
     }
 
     pub fn reset_stats(&mut self) {
@@ -324,6 +356,11 @@ impl WasmIvfFlatKernel {
 
         let nprobe = (nprobe.min(nlist).max(1)) as u32;
         let start_total = Instant::now();
+
+        if let Some(setter) = &self.set_decoded_cache_budget {
+            let _ = setter.call(&mut self.store, self.decoded_cache_budget_bytes);
+        }
+
         let ok = self.search_batch.call(
             &mut self.store,
             (
@@ -388,6 +425,31 @@ impl WasmIvfFlatKernel {
             .call(&mut self.store, (counts_ptr, counts_len_bytes as u32, 4))?;
 
         self.store.data_mut().host.stats.total_time_ns = total_time_ns;
+
+        // Pull kernel-side breakdown stats if available.
+        self.last_kernel_stats = KernelStats::default();
+        if let Some(getter) = &self.last_stats {
+            let stats_ptr = self.alloc.call(&mut self.store, (5 * 8, 8))?;
+            if stats_ptr != 0 {
+                if getter.call(&mut self.store, stats_ptr)? != 0 {
+                    let mut buf = vec![0u8; 5 * 8];
+                    self.memory.read(&mut self.store, stats_ptr as usize, &mut buf)?;
+                    let mut words = [0u64; 5];
+                    for i in 0..5 {
+                        let off = i * 8;
+                        words[i] = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
+                    }
+                    self.last_kernel_stats = KernelStats {
+                        decode_time_ns: words[0],
+                        compute_time_ns: words[1],
+                        decoded_cache_hits: words[2],
+                        decoded_cache_misses: words[3],
+                        decoded_cache_bytes: words[4],
+                    };
+                }
+                let _ = self.dealloc.call(&mut self.store, (stats_ptr, 5 * 8, 8));
+            }
+        }
 
         Ok(results)
     }

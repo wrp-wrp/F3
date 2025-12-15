@@ -71,6 +71,10 @@ struct Args {
     #[arg(long, default_value_t = false)]
     artifact_wasm_no_cache: bool,
 
+    /// Decoded posting cache budget inside Wasm kernel (bytes). Set 0 to disable.
+    #[arg(long, default_value_t = 201_326_592)]
+    artifact_wasm_decoded_cache_bytes: u32,
+
     /// Warmup iterations (builds index once, runs search multiple times).
     #[arg(long, default_value_t = 1)]
     warmup: usize,
@@ -131,6 +135,7 @@ fn main() -> Result<()> {
                     "nprobe": args.nprobe,
                     "posting_codec": args.artifact_posting_codec,
                     "cache_enabled": !args.artifact_wasm_no_cache,
+                    "decoded_cache_budget_bytes": args.artifact_wasm_decoded_cache_bytes,
                 })
             );
         }
@@ -139,6 +144,7 @@ fn main() -> Result<()> {
         let mut kernel = WasmIvfFlatKernel::load(wasm_path, Arc::clone(&artifact))
             .with_context(|| "load wasm ivf-flat kernel")?;
         kernel.set_cache_enabled(!args.artifact_wasm_no_cache);
+        kernel.set_decoded_cache_budget_bytes(args.artifact_wasm_decoded_cache_bytes);
         let nq = args.nq;
 
         // Warmup
@@ -166,6 +172,7 @@ fn main() -> Result<()> {
             };
             let wall_ms = run_start.elapsed().as_secs_f64() * 1000.0;
             let stats = kernel.stats();
+            let kstats = kernel.kernel_stats();
             if args.json {
                 println!(
                     "{}",
@@ -177,9 +184,15 @@ fn main() -> Result<()> {
                         "nprobe": args.nprobe,
                         "posting_codec": args.artifact_posting_codec,
                         "cache_enabled": !args.artifact_wasm_no_cache,
+                        "decoded_cache_budget_bytes": args.artifact_wasm_decoded_cache_bytes,
                         "wall_ms": wall_ms,
                         "kernel_total_ms": (stats.total_time_ns as f64) / 1e6,
                         "fetch_ms": (stats.fetch_time_ns as f64) / 1e6,
+                        "decode_ms": (kstats.decode_time_ns as f64) / 1e6,
+                        "compute_ms": (kstats.compute_time_ns as f64) / 1e6,
+                        "decoded_cache_hits": kstats.decoded_cache_hits,
+                        "decoded_cache_misses": kstats.decoded_cache_misses,
+                        "decoded_cache_bytes": kstats.decoded_cache_bytes,
                         "cache_hits": stats.cache_hits,
                         "chunks_fetched": stats.chunks_fetched,
                         "compressed_bytes_in": stats.compressed_bytes_in,
@@ -190,11 +203,13 @@ fn main() -> Result<()> {
                 );
             } else {
                 println!(
-                    "wasm it={} wall_ms={:.3} kernel_ms={:.3} fetch_ms={:.3} cache_hits={} fetched={} in={} raw={}",
+                    "wasm it={} wall_ms={:.3} kernel_ms={:.3} fetch_ms={:.3} decode_ms={:.3} compute_ms={:.3} cache_hits={} fetched={} in={} raw={}",
                     it,
                     wall_ms,
                     (stats.total_time_ns as f64) / 1e6,
                     (stats.fetch_time_ns as f64) / 1e6,
+                    (kstats.decode_time_ns as f64) / 1e6,
+                    (kstats.compute_time_ns as f64) / 1e6,
                     stats.cache_hits,
                     stats.chunks_fetched,
                     stats.compressed_bytes_in,

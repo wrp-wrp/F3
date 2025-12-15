@@ -1,7 +1,10 @@
 use ordered_float::NotNan;
 use std::alloc::{alloc, dealloc, Layout};
 use std::cmp::Ordering;
+use std::collections::{HashMap, VecDeque};
+use std::sync::Mutex;
 use std::sync::OnceLock;
+use std::time::Instant;
 
 #[link(wasm_import_module = "env")]
 extern "C" {
@@ -30,6 +33,114 @@ pub unsafe extern "C" fn dealloc_ffi(ptr: u32, len: u32, align: u32) {
         return;
     };
     dealloc(ptr as *mut u8, layout);
+}
+
+#[derive(Clone)]
+struct DecodedPosting {
+    row_ids: Vec<u32>,
+    vectors: Vec<f32>, // count * dim
+    bytes: usize,
+}
+
+#[derive(Default)]
+struct DecodedCache {
+    map: HashMap<u32, DecodedPosting>,
+    fifo: VecDeque<u32>,
+    bytes: usize,
+    budget: usize,
+}
+
+impl DecodedCache {
+    fn with_default_budget() -> Self {
+        Self {
+            budget: 192 * 1024 * 1024,
+            ..Default::default()
+        }
+    }
+
+    fn set_budget(&mut self, budget: usize) {
+        self.budget = budget;
+        self.evict_if_needed(0);
+    }
+
+    fn evict_if_needed(&mut self, incoming: usize) {
+        if self.budget == 0 {
+            self.map.clear();
+            self.fifo.clear();
+            self.bytes = 0;
+            return;
+        }
+        while self.bytes + incoming > self.budget {
+            let Some(old) = self.fifo.pop_front() else {
+                break;
+            };
+            if let Some(v) = self.map.remove(&old) {
+                self.bytes = self.bytes.saturating_sub(v.bytes);
+            }
+        }
+    }
+
+    fn get(&self, chunk_id: u32) -> Option<&DecodedPosting> {
+        self.map.get(&chunk_id)
+    }
+
+    fn insert(&mut self, chunk_id: u32, posting: DecodedPosting) {
+        if self.budget == 0 {
+            return;
+        }
+        let incoming = posting.bytes;
+        self.evict_if_needed(incoming);
+        if incoming > self.budget {
+            return;
+        }
+        if let Some(old) = self.map.remove(&chunk_id) {
+            self.bytes = self.bytes.saturating_sub(old.bytes);
+        }
+        self.bytes += posting.bytes;
+        self.map.insert(chunk_id, posting);
+        self.fifo.push_back(chunk_id);
+    }
+}
+
+fn decoded_cache() -> &'static Mutex<DecodedCache> {
+    static CACHE: OnceLock<Mutex<DecodedCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(DecodedCache::with_default_budget()))
+}
+
+#[derive(Default, Clone, Copy)]
+struct LastStats {
+    decode_ns: u64,
+    compute_ns: u64,
+    decoded_cache_hits: u64,
+    decoded_cache_misses: u64,
+    decoded_cache_bytes: u64,
+}
+
+fn last_stats_cell() -> &'static Mutex<LastStats> {
+    static STATS: OnceLock<Mutex<LastStats>> = OnceLock::new();
+    STATS.get_or_init(|| Mutex::new(LastStats::default()))
+}
+
+#[no_mangle]
+pub extern "C" fn ivf_set_decoded_cache_budget_ffi(bytes: u32) {
+    decoded_cache().lock().unwrap().set_budget(bytes as usize);
+}
+
+/// Writes 5x u64 to `out_ptr`:
+/// - decode_ns, compute_ns, decoded_cache_hits, decoded_cache_misses, decoded_cache_bytes
+#[no_mangle]
+pub unsafe extern "C" fn ivf_last_stats_ffi(out_ptr: u32) -> u32 {
+    if out_ptr == 0 {
+        return 0;
+    }
+    let s = *last_stats_cell().lock().unwrap();
+    let out = std::slice::from_raw_parts_mut(out_ptr as *mut u64, 5);
+    out[0] = s.decode_ns;
+    out[1] = s.compute_ns;
+    out[2] = s.decoded_cache_hits;
+    out[3] = s.decoded_cache_misses;
+    out[4] = s.decoded_cache_bytes;
+    1
 }
 
 #[repr(C)]
@@ -142,6 +253,87 @@ fn l2_sq_f16(query: &[f32], vec_f16_bytes: &[u8]) -> f32 {
         off += 2;
     }
     sum
+}
+
+fn decode_row_ids_raw(bytes: &[u8], count: usize) -> Option<Vec<u32>> {
+    if bytes.len() < count * 4 {
+        return None;
+    }
+    let mut out = Vec::<u32>::with_capacity(count);
+    let mut off = 0usize;
+    for _ in 0..count {
+        let v = u32::from_le_bytes(bytes.get(off..off + 4)?.try_into().ok()?);
+        out.push(v);
+        off += 4;
+    }
+    Some(out)
+}
+
+fn decode_vectors_f16_to_f32(bytes: &[u8], count: usize, dim: usize) -> Option<Vec<f32>> {
+    if bytes.len() < count * dim * 2 {
+        return None;
+    }
+    let lut = f16_lut();
+    let mut out = Vec::<f32>::with_capacity(count * dim);
+    let mut off = 0usize;
+    for _ in 0..(count * dim) {
+        let b0 = *bytes.get(off)?;
+        let b1 = *bytes.get(off + 1)?;
+        let bits = u16::from_le_bytes([b0, b1]);
+        out.push(lut[bits as usize]);
+        off += 2;
+    }
+    Some(out)
+}
+
+fn decode_posting_raw_f16(bytes: &[u8], dim: usize) -> Option<DecodedPosting> {
+    if bytes.len() < 4 {
+        return None;
+    }
+    let count = u32::from_le_bytes(bytes[0..4].try_into().ok()?) as usize;
+    let row_ids_bytes = 4 + count * 4;
+    let vectors_bytes = count * dim * 2;
+    if bytes.len() != row_ids_bytes + vectors_bytes {
+        return None;
+    }
+    let row_ids = decode_row_ids_raw(&bytes[4..row_ids_bytes], count)?;
+    let vectors = decode_vectors_f16_to_f32(&bytes[row_ids_bytes..], count, dim)?;
+    let mem_bytes = row_ids.len() * 4 + vectors.len() * 4;
+    Some(DecodedPosting {
+        row_ids,
+        vectors,
+        bytes: mem_bytes,
+    })
+}
+
+fn decode_posting_delta_f16(bytes: &[u8], dim: usize) -> Option<DecodedPosting> {
+    if bytes.len() < 8 {
+        return None;
+    }
+    let count = u32::from_le_bytes(bytes[0..4].try_into().ok()?) as usize;
+    let mut cur_row = u32::from_le_bytes(bytes[4..8].try_into().ok()?);
+    let mut offset = 8usize;
+    let mut row_ids = Vec::<u32>::with_capacity(count);
+    if count > 0 {
+        row_ids.push(cur_row);
+        for _ in 1..count {
+            let (delta, used) = decode_uleb128_u32(&bytes[offset..])?;
+            offset += used;
+            cur_row = cur_row.wrapping_add(delta);
+            row_ids.push(cur_row);
+        }
+    }
+    let vectors_bytes = count * dim * 2;
+    if bytes.len() != offset + vectors_bytes {
+        return None;
+    }
+    let vectors = decode_vectors_f16_to_f32(&bytes[offset..], count, dim)?;
+    let mem_bytes = row_ids.len() * 4 + vectors.len() * 4;
+    Some(DecodedPosting {
+        row_ids,
+        vectors,
+        bytes: mem_bytes,
+    })
 }
 
 fn l2_sq(a: &[f32], b: &[f32]) -> f32 {
@@ -487,6 +679,11 @@ pub unsafe extern "C" fn ivf_flat_search_batch_ffi(
     let out_cap = out_cap as usize;
     let k = (k.min(out_cap as u32)) as usize;
 
+    let mut decode_ns: u64 = 0;
+    let mut compute_ns: u64 = 0;
+    let mut decoded_cache_hits: u64 = 0;
+    let mut decoded_cache_misses: u64 = 0;
+
     for q in 0..(nq as usize) {
         let query = &queries[q * dim as usize..(q + 1) * dim as usize];
 
@@ -506,6 +703,42 @@ pub unsafe extern "C" fn ivf_flat_search_batch_ffi(
             if posting_chunk_id == 0 {
                 continue;
             }
+
+            // For f16 codecs, cache decoded postings to avoid repeated dynamic decoding.
+            if posting_codec == 2 || posting_codec == 3 {
+                if let Some(posting) = decoded_cache().lock().unwrap().get(posting_chunk_id) {
+                    decoded_cache_hits += 1;
+                    let start_compute = Instant::now();
+                    for (pos, &row_id) in posting.row_ids.iter().enumerate() {
+                        let v = &posting.vectors[pos * dim as usize..(pos + 1) * dim as usize];
+                        heap_push_topk(&mut heap, k, row_id, l2_sq(query, v));
+                    }
+                    compute_ns += start_compute.elapsed().as_nanos() as u64;
+                    continue;
+                }
+                decoded_cache_misses += 1;
+                let bytes = match fetch_chunk(posting_chunk_id) {
+                    Some(b) => b,
+                    None => continue,
+                };
+                let start_decode = Instant::now();
+                let decoded = match posting_codec {
+                    2 => decode_posting_raw_f16(&bytes, dim as usize),
+                    3 => decode_posting_delta_f16(&bytes, dim as usize),
+                    _ => None,
+                };
+                decode_ns += start_decode.elapsed().as_nanos() as u64;
+                let Some(decoded) = decoded else { continue; };
+                let start_compute = Instant::now();
+                for (pos, &row_id) in decoded.row_ids.iter().enumerate() {
+                    let v = &decoded.vectors[pos * dim as usize..(pos + 1) * dim as usize];
+                    heap_push_topk(&mut heap, k, row_id, l2_sq(query, v));
+                }
+                compute_ns += start_compute.elapsed().as_nanos() as u64;
+                decoded_cache().lock().unwrap().insert(posting_chunk_id, decoded);
+                continue;
+            }
+
             let bytes = match fetch_chunk(posting_chunk_id) {
                 Some(b) => b,
                 None => continue,
@@ -635,6 +868,15 @@ pub unsafe extern "C" fn ivf_flat_search_batch_ffi(
         let base = q * out_cap * 2;
         counts[q] = write_out_pairs(&mut out_words[base..base + out_cap * 2], k, heap.into_vec());
     }
+
+    let cache_bytes = decoded_cache().lock().unwrap().bytes as u64;
+    *last_stats_cell().lock().unwrap() = LastStats {
+        decode_ns,
+        compute_ns,
+        decoded_cache_hits,
+        decoded_cache_misses,
+        decoded_cache_bytes: cache_bytes,
+    };
 
     1
 }

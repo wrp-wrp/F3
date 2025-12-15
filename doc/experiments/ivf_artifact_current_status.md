@@ -53,27 +53,28 @@ Wasm 内核提供 batch API（一次传 `nq>1` 个 query），可以扫 `nq` 看
 ## 已跑结果（SIFT100K，最新一次）
 
 - 运行脚本：`bash scripts/run_sift_ivf_experiments.sh`
-- 本地结果目录：`results/sift_ivf_artifact_20251215_211719/`
+- 本地结果目录：`results/sift_ivf_artifact_20251215_232708/`
 - 汇总方式：对每个 `.jsonl` 的 `wall_ms` 取 p50/p95/p99（n=10）
 
 | case | index_bytes | p50_ms | p95_ms | p99_ms | 备注 |
 |---|---:|---:|---:|---:|---|
-| native_sidecar_nq1 | 51,633,360 | 1.127 | 1.177 | 1.177 | IVF sidecar（旧路径） |
-| native_sidecar_nq32 | 51,633,360 | 28.411 | 29.147 | 29.147 | nq=32 |
-| native_artifact_raw_nq32 | 51,640,895 | 28.805 | 31.944 | 31.944 | artifact + raw（decoded cache 生效后接近 sidecar） |
-| native_artifact_delta_nq32 | 51,355,625 | 29.059 | 29.877 | 29.877 | artifact + row_id delta-varint |
-| native_artifact_raw_f16_nq32 | 26,041,127 | 28.926 | 30.032 | 30.032 | artifact + f16 vectors（~2x 更小，且 p50 接近 f32） |
-| native_artifact_delta_f16_nq32 | 25,755,857 | 29.858 | 44.081 | 44.081 | artifact + f16 vectors（~2x 更小；p95 仍偏高） |
-| wasm_artifact_raw_cache_nq32 | 51,640,895 | 82.533 | 87.060 | 87.060 | Wasm + cache |
-| wasm_artifact_delta_cache_nq32 | 51,355,625 | 94.297 | 124.418 | 124.418 | Wasm + cache |
-| wasm_artifact_raw_f16_cache_nq32 | 26,041,127 | 121.617 | 229.228 | 229.228 | Wasm + cache + f16 vectors |
-| wasm_artifact_delta_f16_cache_nq32 | 25,755,857 | 115.902 | 118.694 | 118.694 | Wasm + cache + f16 vectors |
-| wasm_artifact_delta_nocache_nq32 | 51,355,625 | 99.649 | 106.011 | 106.011 | Wasm + **no cache**（会大量重复 fetch chunk） |
-| wasm_artifact_delta_cache_nq1 | 51,355,625 | 3.433 | 4.196 | 4.196 | nq=1 |
+| native_sidecar_nq1 | 51,633,360 | 1.019 | 1.101 | 1.101 | IVF sidecar（旧路径） |
+| native_sidecar_nq32 | 51,633,360 | 28.157 | 28.599 | 28.599 | nq=32 |
+| native_artifact_raw_nq32 | 51,640,895 | 27.685 | 27.775 | 27.775 | artifact + raw（decoded cache 生效后接近 sidecar） |
+| native_artifact_delta_nq32 | 51,355,625 | 27.720 | 28.214 | 28.214 | artifact + row_id delta-varint |
+| native_artifact_raw_f16_nq32 | 26,041,127 | 27.693 | 28.119 | 28.119 | artifact + f16 vectors（~2x 更小，p50 追平） |
+| native_artifact_delta_f16_nq32 | 25,755,857 | 27.678 | 28.117 | 28.117 | artifact + f16 vectors（~2x 更小，p50 追平） |
+| wasm_artifact_raw_cache_nq32 | 51,640,895 | 78.345 | 80.515 | 80.515 | Wasm + host chunk cache |
+| wasm_artifact_delta_cache_nq32 | 51,355,625 | 81.329 | 84.611 | 84.611 | Wasm + host chunk cache |
+| wasm_artifact_raw_f16_cache_nq32 | 26,041,127 | 48.622 | 50.526 | 50.526 | Wasm + **kernel decoded cache** + f16 vectors |
+| wasm_artifact_delta_f16_cache_nq32 | 25,755,857 | 48.281 | 49.055 | 49.055 | Wasm + **kernel decoded cache** + f16 vectors |
+| wasm_artifact_delta_nocache_nq32 | 51,355,625 | 93.569 | 98.037 | 98.037 | Wasm + **no host cache**（会大量重复 fetch chunk） |
+| wasm_artifact_delta_cache_nq1 | 51,355,625 | 3.093 | 3.235 | 3.235 | nq=1 |
 
 说明：
 - `index_bytes` 目前下降很小，是因为 **只压了 row_id**，posting chunk 里的向量仍是 `f32` 原样存（体积大头在向量）。
 - `*_f16` codec 将 posting vectors 存为 `f16`，所以 index 大小约减半；native 路径由于 `IvfFlatArtifactSearcher` 缓存了已解码 posting（热），所以 p50 基本追平 `f32`。
+- Wasm 路径为了证明“动态解压在 Wasm 内也不慢”，新增了 **kernel 内 decoded cache + decode/compute breakdown**：在 warm 场景下 `decode_ms≈0`（解码在 warmup 完成），`compute_ms` 成为主要开销（见 `.jsonl` 每行的 `decode_ms/compute_ms/decoded_cache_*` 字段）。
 - Wasm `nocache` 会显著增加 `fetch_ms / compressed_bytes_in`（见对应 `.jsonl` 的每行 stats 字段）。
 
 ### Size 拆分（同一份 index 文件）

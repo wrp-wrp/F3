@@ -4,8 +4,8 @@ use arrow_array::FixedSizeListArray;
 use clap::Parser;
 use fff_poc::reader::{FileReaderV2Builder, Projection, Selection};
 use fff_vindex::artifact::ivf_flat::{
-    build_ivf_flat_artifact_with_options, load_ivf_flat_artifact, search_ivf_flat_artifact_native,
-    IvfFlatArtifactBuildOptions, PostingCodec,
+    build_ivf_flat_artifact_with_options, load_ivf_flat_artifact, IvfFlatArtifactBuildOptions,
+    IvfFlatArtifactSearcher, PostingCodec,
 };
 use fff_vindex::artifact::wasm_ivf_flat::WasmIvfFlatKernel;
 use fff_vindex::ivf_flat::{
@@ -63,7 +63,7 @@ struct Args {
     #[arg(long)]
     artifact_wasm_kernel: Option<PathBuf>,
 
-    /// Posting codec for artifact: `raw` or `row_id_delta_varint_v1`.
+    /// Posting codec for artifact: `raw`, `row_id_delta_varint_v1`, `raw_f16`, `row_id_delta_varint_v1_f16`.
     #[arg(long, default_value = "raw")]
     artifact_posting_codec: String,
 
@@ -104,6 +104,8 @@ fn main() -> Result<()> {
         let posting_codec = match args.artifact_posting_codec.as_str() {
             "raw" => PostingCodec::Raw,
             "row_id_delta_varint_v1" => PostingCodec::RowIdDeltaVarintV1,
+            "raw_f16" => PostingCodec::RawF16,
+            "row_id_delta_varint_v1_f16" => PostingCodec::RowIdDeltaVarintV1F16,
             other => return Err(anyhow!("unsupported --artifact-posting-codec: {other}")),
         };
         let index_path = build_ivf_flat_artifact_with_options(
@@ -207,6 +209,8 @@ fn main() -> Result<()> {
         let posting_codec = match args.artifact_posting_codec.as_str() {
             "raw" => PostingCodec::Raw,
             "row_id_delta_varint_v1" => PostingCodec::RowIdDeltaVarintV1,
+            "raw_f16" => PostingCodec::RawF16,
+            "row_id_delta_varint_v1_f16" => PostingCodec::RowIdDeltaVarintV1F16,
             other => return Err(anyhow!("unsupported --artifact-posting-codec: {other}")),
         };
         let index_path = build_ivf_flat_artifact_with_options(
@@ -234,11 +238,11 @@ fn main() -> Result<()> {
                 })
             );
         }
-        let artifact = load_ivf_flat_artifact(&index_path)?;
+        let searcher = IvfFlatArtifactSearcher::open(&index_path)?;
         for _ in 0..args.warmup {
             for q in 0..args.nq {
                 let query = &queries[q * args.dim..(q + 1) * args.dim];
-                let _ = search_ivf_flat_artifact_native(&artifact, query, args.k, args.nprobe)?;
+                let _ = searcher.search(query, args.k, args.nprobe)?;
             }
         }
         let mut last = Vec::new();
@@ -246,7 +250,7 @@ fn main() -> Result<()> {
             let run_start = Instant::now();
             for q in 0..args.nq {
                 let query = &queries[q * args.dim..(q + 1) * args.dim];
-                last = search_ivf_flat_artifact_native(&artifact, query, args.k, args.nprobe)?;
+                last = searcher.search(query, args.k, args.nprobe)?;
             }
             let wall_ms = run_start.elapsed().as_secs_f64() * 1000.0;
             if args.json {

@@ -2,6 +2,7 @@ use crate::artifact::ivf_flat::{ChunkType, IvfFlatArtifact, PostingCodec};
 use crate::ivf_flat::SearchResult;
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
+use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
@@ -11,9 +12,10 @@ use wasmtime::{Caller, Engine, Linker, Memory, Module, Store, TypedFunc};
 #[derive(Default)]
 struct HostState {
     artifact: Option<Arc<IvfFlatArtifact>>,
+    file: Option<File>,
     cache: HashMap<u32, Vec<u8>>,
-    pending: HashMap<u32, Vec<u8>>,
     raw_lens: Vec<u64>,
+    lens: Vec<u32>,
     stats: FetchStats,
     cache_enabled: bool,
 }
@@ -26,9 +28,15 @@ struct WasmState {
 impl HostState {
     fn set_artifact(&mut self, artifact: Arc<IvfFlatArtifact>) {
         self.raw_lens = artifact.footer().chunks.iter().map(|c| c.raw_len).collect();
+        self.lens = artifact
+            .footer()
+            .chunks
+            .iter()
+            .map(|c| u32::try_from(c.len).unwrap_or(0))
+            .collect();
+        self.file = File::open(artifact.path()).ok();
         self.artifact = Some(artifact);
         self.cache.clear();
-        self.pending.clear();
         self.stats = FetchStats::default();
         self.cache_enabled = true;
     }
@@ -39,64 +47,43 @@ impl HostState {
             self.stats.note_chunk(chunk_id, /*miss=*/false);
             return Ok(u32::try_from(buf.len()).unwrap_or(0));
         }
-        if let Some(buf) = self.pending.get(&chunk_id) {
-            self.stats.note_chunk(chunk_id, /*miss=*/false);
-            return Ok(u32::try_from(buf.len()).unwrap_or(0));
-        }
-        let artifact = self
-            .artifact
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("artifact not set in host state"))?;
-        let start = Instant::now();
-        let bytes = artifact.read_chunk_bytes_by_index(chunk_id)?;
-        self.stats.fetch_time_ns += start.elapsed().as_nanos() as u64;
-        self.stats.chunks_fetched += 1;
-        self.stats.compressed_bytes_in += bytes.len() as u64;
-        if let Some(raw_len) = self.raw_lens.get(chunk_id as usize).copied() {
-            self.stats.raw_bytes_decoded += raw_len;
-        }
-        self.stats.note_chunk(chunk_id, /*miss=*/true);
-        if self.cache_enabled {
-            self.cache.insert(chunk_id, bytes);
-            Ok(u32::try_from(self.cache[&chunk_id].len()).unwrap_or(0))
-        } else {
-            self.pending.insert(chunk_id, bytes);
-            Ok(u32::try_from(self.pending[&chunk_id].len()).unwrap_or(0))
-        }
+        Ok(self.lens.get(chunk_id as usize).copied().unwrap_or(0))
     }
 
     fn read_chunk_into(&mut self, chunk_id: u32, dst: &mut [u8]) -> Result<u32> {
-        let mut bytes = if let Some(buf) = self.cache.get(&chunk_id) {
+        let bytes = if let Some(buf) = self.cache.get(&chunk_id) {
             self.stats.cache_hits += 1;
             self.stats.note_chunk(chunk_id, /*miss=*/false);
             buf.clone()
-        } else if let Some(buf) = self.pending.remove(&chunk_id) {
-            self.stats.note_chunk(chunk_id, /*miss=*/false);
-            buf
         } else {
-            // Fallback: load on-demand (should be rare because wasm calls host_chunk_len first).
-            let len = self.chunk_len(chunk_id)?;
-            if len == 0 {
-                return Ok(0);
+            let artifact = self
+                .artifact
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("artifact not set in host state"))?;
+            let file = self
+                .file
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("artifact file not open in host state"))?;
+            let start = Instant::now();
+            let bytes = artifact.read_chunk_bytes_by_index_from_file(file, chunk_id)?;
+            self.stats.fetch_time_ns += start.elapsed().as_nanos() as u64;
+            self.stats.chunks_fetched += 1;
+            self.stats.compressed_bytes_in += bytes.len() as u64;
+            if let Some(raw_len) = self.raw_lens.get(chunk_id as usize).copied() {
+                self.stats.raw_bytes_decoded += raw_len;
             }
-            if let Some(buf) = self.cache.get(&chunk_id) {
-                buf.clone()
-            } else if let Some(buf) = self.pending.remove(&chunk_id) {
-                buf
-            } else {
-                return Ok(0);
+            self.stats.note_chunk(chunk_id, /*miss=*/true);
+            if self.cache_enabled {
+                self.cache.insert(chunk_id, bytes.clone());
             }
+            bytes
         };
 
         if bytes.len() > dst.len() {
             return Ok(0);
         }
         dst[..bytes.len()].copy_from_slice(&bytes);
-        let n = bytes.len() as u32;
-        if self.cache_enabled && !self.cache.contains_key(&chunk_id) {
-            self.cache.insert(chunk_id, std::mem::take(&mut bytes));
-        }
-        Ok(n)
+        Ok(bytes.len() as u32)
     }
 }
 
@@ -274,6 +261,8 @@ impl WasmIvfFlatKernel {
         let posting_codec_id: u32 = match posting_codec {
             PostingCodec::Raw => 0,
             PostingCodec::RowIdDeltaVarintV1 => 1,
+            PostingCodec::RawF16 => 2,
+            PostingCodec::RowIdDeltaVarintV1F16 => 3,
         };
 
         let mut posting_ids = vec![0u32; nlist];

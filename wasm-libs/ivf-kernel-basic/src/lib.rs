@@ -1,6 +1,7 @@
 use ordered_float::NotNan;
 use std::alloc::{alloc, dealloc, Layout};
 use std::cmp::Ordering;
+use std::sync::OnceLock;
 
 #[link(wasm_import_module = "env")]
 extern "C" {
@@ -83,6 +84,64 @@ fn decode_uleb128_u32(mut input: &[u8]) -> Option<(u32, usize)> {
             return None;
         }
     }
+}
+
+fn f16_bits_to_f32(bits: u16) -> f32 {
+    // IEEE-754 half -> float conversion.
+    // Based on common reference implementations; handles subnormals/inf/nan.
+    let sign = ((bits >> 15) & 0x1) as u32;
+    let exp = ((bits >> 10) & 0x1f) as u32;
+    let frac = (bits & 0x03ff) as u32;
+
+    let out_sign = sign << 31;
+    let out: u32 = if exp == 0 {
+        if frac == 0 {
+            out_sign
+        } else {
+            // subnormal: normalize
+            let mut e = -14i32;
+            let mut f = frac;
+            while (f & 0x0400) == 0 {
+                f <<= 1;
+                e -= 1;
+            }
+            f &= 0x03ff;
+            let exp32 = (e + 127) as u32;
+            out_sign | (exp32 << 23) | (f << 13)
+        }
+    } else if exp == 0x1f {
+        // inf/nan
+        out_sign | 0x7f800000 | (frac << 13)
+    } else {
+        let exp32 = (exp as i32 - 15 + 127) as u32;
+        out_sign | (exp32 << 23) | (frac << 13)
+    };
+    f32::from_bits(out)
+}
+
+fn f16_lut() -> &'static [f32] {
+    static LUT: OnceLock<Vec<f32>> = OnceLock::new();
+    LUT.get_or_init(|| {
+        let mut v = Vec::with_capacity(65536);
+        for bits in 0u32..=0xffff {
+            v.push(f16_bits_to_f32(bits as u16));
+        }
+        v
+    })
+}
+
+fn l2_sq_f16(query: &[f32], vec_f16_bytes: &[u8]) -> f32 {
+    let mut sum = 0.0f32;
+    let mut off = 0usize;
+    let lut = f16_lut();
+    for &q in query {
+        let bits = u16::from_le_bytes([vec_f16_bytes[off], vec_f16_bytes[off + 1]]);
+        let v = lut[bits as usize];
+        let d = q - v;
+        sum += d * d;
+        off += 2;
+    }
+    sum
 }
 
 fn l2_sq(a: &[f32], b: &[f32]) -> f32 {
@@ -234,13 +293,14 @@ pub unsafe extern "C" fn ivf_flat_search_ffi(
             continue;
         }
         let count = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
-        let vectors_bytes = count * dim as usize * 4;
+        let vectors_bytes_f32 = count * dim as usize * 4;
+        let vectors_bytes_f16 = count * dim as usize * 2;
 
         match posting_codec {
             0 => {
                 // raw: [count:u32][row_ids:u32*count][vectors]
                 let row_ids_bytes = 4 + count * 4;
-                if bytes.len() != row_ids_bytes + vectors_bytes {
+                if bytes.len() != row_ids_bytes + vectors_bytes_f32 {
                     continue;
                 }
                 let row_ids: &[u32] = std::slice::from_raw_parts(
@@ -274,7 +334,7 @@ pub unsafe extern "C" fn ivf_flat_search_ffi(
                 if offset == usize::MAX {
                     continue;
                 }
-                if bytes.len() != offset + vectors_bytes {
+                if bytes.len() != offset + vectors_bytes_f32 {
                     continue;
                 }
                 let vectors: &[f32] = std::slice::from_raw_parts(
@@ -294,6 +354,61 @@ pub unsafe extern "C" fn ivf_flat_search_ffi(
                     }
                     let v = &vectors[pos * dim as usize..(pos + 1) * dim as usize];
                     heap_push_topk(&mut heap, k, cur_row, l2_sq(query, v));
+                }
+            }
+            2 => {
+                // raw_f16: [count:u32][row_ids:u32*count][vectors:f16]
+                let row_ids_bytes = 4 + count * 4;
+                if bytes.len() != row_ids_bytes + vectors_bytes_f16 {
+                    continue;
+                }
+                let row_ids: &[u32] = std::slice::from_raw_parts(
+                    bytes[4..row_ids_bytes].as_ptr() as *const u32,
+                    count,
+                );
+                let vectors_bytes = &bytes[row_ids_bytes..];
+                for (pos, &row_id) in row_ids.iter().enumerate() {
+                    let off = pos * dim as usize * 2;
+                    let v = &vectors_bytes[off..off + dim as usize * 2];
+                    heap_push_topk(&mut heap, k, row_id, l2_sq_f16(query, v));
+                }
+            }
+            3 => {
+                // row_id_delta_varint_v1_f16: [count:u32][first:u32][deltas:uleb128*(count-1)][vectors:f16]
+                if bytes.len() < 8 {
+                    continue;
+                }
+                let mut offset = 8usize;
+                if count > 1 {
+                    for _ in 1..count {
+                        let Some((_, used)) = decode_uleb128_u32(&bytes[offset..]) else {
+                            offset = usize::MAX;
+                            break;
+                        };
+                        offset += used;
+                    }
+                }
+                if offset == usize::MAX {
+                    continue;
+                }
+                if bytes.len() != offset + vectors_bytes_f16 {
+                    continue;
+                }
+                let vectors_bytes = &bytes[offset..];
+
+                let mut cur_row = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+                let mut off2 = 8usize;
+                for pos in 0..count {
+                    if pos > 0 {
+                        let Some((delta, used)) = decode_uleb128_u32(&bytes[off2..]) else {
+                            break;
+                        };
+                        off2 += used;
+                        cur_row = cur_row.wrapping_add(delta);
+                    }
+                    let off = pos * dim as usize * 2;
+                    let v = &vectors_bytes[off..off + dim as usize * 2];
+                    heap_push_topk(&mut heap, k, cur_row, l2_sq_f16(query, v));
                 }
             }
             _ => continue,
@@ -399,12 +514,13 @@ pub unsafe extern "C" fn ivf_flat_search_batch_ffi(
                 continue;
             }
             let count = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
-            let vectors_bytes = count * dim as usize * 4;
+            let vectors_bytes_f32 = count * dim as usize * 4;
+            let vectors_bytes_f16 = count * dim as usize * 2;
 
             match posting_codec {
                 0 => {
                     let row_ids_bytes = 4 + count * 4;
-                    if bytes.len() != row_ids_bytes + vectors_bytes {
+                    if bytes.len() != row_ids_bytes + vectors_bytes_f32 {
                         continue;
                     }
                     let row_ids: &[u32] = std::slice::from_raw_parts(
@@ -437,7 +553,7 @@ pub unsafe extern "C" fn ivf_flat_search_batch_ffi(
                     if offset == usize::MAX {
                         continue;
                     }
-                    if bytes.len() != offset + vectors_bytes {
+                    if bytes.len() != offset + vectors_bytes_f32 {
                         continue;
                     }
                     let vectors: &[f32] = std::slice::from_raw_parts(
@@ -457,6 +573,59 @@ pub unsafe extern "C" fn ivf_flat_search_batch_ffi(
                         }
                         let v = &vectors[pos * dim as usize..(pos + 1) * dim as usize];
                         heap_push_topk(&mut heap, k, cur_row, l2_sq(query, v));
+                    }
+                }
+                2 => {
+                    let row_ids_bytes = 4 + count * 4;
+                    if bytes.len() != row_ids_bytes + vectors_bytes_f16 {
+                        continue;
+                    }
+                    let row_ids: &[u32] = std::slice::from_raw_parts(
+                        bytes[4..row_ids_bytes].as_ptr() as *const u32,
+                        count,
+                    );
+                    let vectors_bytes = &bytes[row_ids_bytes..];
+                    for (pos, &row_id) in row_ids.iter().enumerate() {
+                        let off = pos * dim as usize * 2;
+                        let v = &vectors_bytes[off..off + dim as usize * 2];
+                        heap_push_topk(&mut heap, k, row_id, l2_sq_f16(query, v));
+                    }
+                }
+                3 => {
+                    if bytes.len() < 8 {
+                        continue;
+                    }
+                    let mut offset = 8usize;
+                    if count > 1 {
+                        for _ in 1..count {
+                            let Some((_, used)) = decode_uleb128_u32(&bytes[offset..]) else {
+                                offset = usize::MAX;
+                                break;
+                            };
+                            offset += used;
+                        }
+                    }
+                    if offset == usize::MAX {
+                        continue;
+                    }
+                    if bytes.len() != offset + vectors_bytes_f16 {
+                        continue;
+                    }
+                    let vectors_bytes = &bytes[offset..];
+
+                    let mut cur_row = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+                    let mut off2 = 8usize;
+                    for pos in 0..count {
+                        if pos > 0 {
+                            let Some((delta, used)) = decode_uleb128_u32(&bytes[off2..]) else {
+                                break;
+                            };
+                            off2 += used;
+                            cur_row = cur_row.wrapping_add(delta);
+                        }
+                        let off = pos * dim as usize * 2;
+                        let v = &vectors_bytes[off..off + dim as usize * 2];
+                        heap_push_topk(&mut heap, k, cur_row, l2_sq_f16(query, v));
                     }
                 }
                 _ => continue,

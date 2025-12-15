@@ -15,6 +15,7 @@ byteorder = { workspace = true }
 ordered-float = "4.5.0"
 wasmtime = { workspace = true }
 wasi-common = { workspace = true }
+half = "2.4.1"
 
 fff-poc = { path = "../fff-poc" }
 fff-format = { path = "../fff-format" }

@@ -61,12 +61,18 @@ run_case "native_sidecar_nq32" --nq 32
 
 run_case "native_artifact_raw_nq32" --artifact --artifact-posting-codec raw --nq 32
 run_case "native_artifact_delta_nq32" --artifact --artifact-posting-codec row_id_delta_varint_v1 --nq 32
+run_case "native_artifact_raw_f16_nq32" --artifact --artifact-posting-codec raw_f16 --nq 32
+run_case "native_artifact_delta_f16_nq32" --artifact --artifact-posting-codec row_id_delta_varint_v1_f16 --nq 32
 
 # Wasm (cache on/off, raw/delta, nq 1 vs 32)
 run_case "wasm_artifact_raw_cache_nq32" \
   --artifact-wasm-kernel "$wasm_kernel" --artifact-posting-codec raw --nq 32
 run_case "wasm_artifact_delta_cache_nq32" \
   --artifact-wasm-kernel "$wasm_kernel" --artifact-posting-codec row_id_delta_varint_v1 --nq 32
+run_case "wasm_artifact_raw_f16_cache_nq32" \
+  --artifact-wasm-kernel "$wasm_kernel" --artifact-posting-codec raw_f16 --nq 32
+run_case "wasm_artifact_delta_f16_cache_nq32" \
+  --artifact-wasm-kernel "$wasm_kernel" --artifact-posting-codec row_id_delta_varint_v1_f16 --nq 32
 run_case "wasm_artifact_delta_nocache_nq32" \
   --artifact-wasm-kernel "$wasm_kernel" --artifact-posting-codec row_id_delta_varint_v1 --artifact-wasm-no-cache --nq 32
 run_case "wasm_artifact_delta_cache_nq1" \

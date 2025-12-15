@@ -3393,6 +3393,7 @@ dependencies = [
  "byteorder",
  "fff-format",
  "fff-poc",
+ "half",
  "ordered-float 4.6.0",
  "rand",
  "serde",

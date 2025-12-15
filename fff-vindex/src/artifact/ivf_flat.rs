@@ -5,15 +5,29 @@ use crate::ivf_flat::{
 use crate::manifest::{BaseFileBinding, IndexEntry, IndexKind, IndexManifest};
 use anyhow::{bail, Context, Result};
 use byteorder::{ByteOrder, LittleEndian};
+use half::f16;
 use rand::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 const ARTIFACT_MAGIC: &[u8; 8] = b"F3VIDX1\0";
 const ARTIFACT_FOOTER_MAGIC: &[u8; 8] = b"F3VIDXF\0";
 const ARTIFACT_VERSION: u32 = 1;
+
+fn f16_lut() -> &'static [f32] {
+    static LUT: OnceLock<Vec<f32>> = OnceLock::new();
+    LUT.get_or_init(|| {
+        let mut v = Vec::with_capacity(65536);
+        for bits in 0u32..=0xffff {
+            v.push(f16::from_bits(bits as u16).to_f32());
+        }
+        v
+    })
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -28,6 +42,8 @@ pub enum ChunkType {
 pub enum PostingCodec {
     Raw,
     RowIdDeltaVarintV1,
+    RawF16,
+    RowIdDeltaVarintV1F16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,6 +75,31 @@ pub struct IvfFlatArtifactFooter {
 pub struct IvfFlatArtifact {
     path: PathBuf,
     footer: IvfFlatArtifactFooter,
+}
+
+#[cfg(unix)]
+fn read_exact_at(file: &File, offset: u64, mut dst: &mut [u8]) -> io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    let mut off = offset;
+    while !dst.is_empty() {
+        let n = file.read_at(dst, off)?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "read_at returned 0",
+            ));
+        }
+        off += n as u64;
+        dst = &mut dst[n..];
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn read_exact_at(file: &File, offset: u64, dst: &mut [u8]) -> io::Result<()> {
+    let mut f = file.try_clone()?;
+    f.seek(SeekFrom::Start(offset))?;
+    f.read_exact(dst)
 }
 
 impl IvfFlatArtifact {
@@ -105,6 +146,10 @@ impl IvfFlatArtifact {
         Ok(Self { path, footer })
     }
 
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     pub fn footer(&self) -> &IvfFlatArtifactFooter {
         &self.footer
     }
@@ -142,6 +187,10 @@ impl IvfFlatArtifact {
         Ok(())
     }
 
+    pub fn open_data_file(&self) -> Result<File> {
+        File::open(&self.path).with_context(|| format!("open artifact {}", self.path.display()))
+    }
+
     fn find_chunk(&self, chunk_type: ChunkType, list_id: Option<u32>) -> Result<&ChunkDesc> {
         self.footer
             .chunks
@@ -160,6 +209,13 @@ impl IvfFlatArtifact {
         Ok(buf)
     }
 
+    fn read_chunk_bytes_from_file(&self, file: &File, desc: &ChunkDesc) -> Result<Vec<u8>> {
+        let mut buf = vec![0u8; desc.len as usize];
+        read_exact_at(file, desc.offset, &mut buf)
+            .with_context(|| format!("read artifact bytes at off={} len={}", desc.offset, desc.len))?;
+        Ok(buf)
+    }
+
     pub(crate) fn read_chunk_bytes_by_index(&self, chunk_id: u32) -> Result<Vec<u8>> {
         let idx = chunk_id as usize;
         let desc = self
@@ -168,6 +224,30 @@ impl IvfFlatArtifact {
             .get(idx)
             .ok_or_else(|| anyhow::anyhow!("chunk_id out of range: {chunk_id}"))?;
         self.read_chunk_bytes(desc)
+    }
+
+    pub(crate) fn chunk_len_by_index(&self, chunk_id: u32) -> Result<u32> {
+        let idx = chunk_id as usize;
+        let desc = self
+            .footer
+            .chunks
+            .get(idx)
+            .ok_or_else(|| anyhow::anyhow!("chunk_id out of range: {chunk_id}"))?;
+        Ok(u32::try_from(desc.len).unwrap_or(0))
+    }
+
+    pub(crate) fn read_chunk_bytes_by_index_from_file(
+        &self,
+        file: &File,
+        chunk_id: u32,
+    ) -> Result<Vec<u8>> {
+        let idx = chunk_id as usize;
+        let desc = self
+            .footer
+            .chunks
+            .get(idx)
+            .ok_or_else(|| anyhow::anyhow!("chunk_id out of range: {chunk_id}"))?;
+        self.read_chunk_bytes_from_file(file, desc)
     }
 
     pub(crate) fn find_chunk_id(&self, chunk_type: ChunkType, list_id: Option<u32>) -> Result<u32> {
@@ -183,6 +263,17 @@ impl IvfFlatArtifact {
     pub fn read_centroids_f32(&self) -> Result<Vec<f32>> {
         let desc = self.find_chunk(ChunkType::Centroids, None)?;
         let bytes = self.read_chunk_bytes(desc)?;
+        if bytes.len() % 4 != 0 {
+            bail!("centroids chunk not aligned to f32");
+        }
+        let mut out = vec![0f32; bytes.len() / 4];
+        LittleEndian::read_f32_into(&bytes, &mut out);
+        Ok(out)
+    }
+
+    pub fn read_centroids_f32_from_file(&self, file: &File) -> Result<Vec<f32>> {
+        let desc = self.find_chunk(ChunkType::Centroids, None)?;
+        let bytes = self.read_chunk_bytes_from_file(file, desc)?;
         if bytes.len() % 4 != 0 {
             bail!("centroids chunk not aligned to f32");
         }
@@ -255,6 +346,190 @@ impl IvfFlatArtifact {
                 }
                 let mut vectors = vec![0f32; count * dim];
                 LittleEndian::read_f32_into(&bytes[offset..], &mut vectors);
+                Ok((row_ids, vectors))
+            }
+            PostingCodec::RawF16 => {
+                if bytes.len() < 4 {
+                    bail!("posting_list(f16) chunk too small");
+                }
+                let count = LittleEndian::read_u32(&bytes[0..4]) as usize;
+                let row_ids_bytes = 4 + count * 4;
+                let vectors_bytes = count * dim * 2;
+                let expected = row_ids_bytes + vectors_bytes;
+                if bytes.len() != expected {
+                    bail!(
+                        "posting_list(f16) size mismatch: expected {expected} bytes, got {}",
+                        bytes.len()
+                    );
+                }
+                let mut row_ids = vec![0u32; count];
+                LittleEndian::read_u32_into(&bytes[4..row_ids_bytes], &mut row_ids);
+                let mut vectors = vec![0f32; count * dim];
+                let mut off = row_ids_bytes;
+                let lut = f16_lut();
+                for i in 0..(count * dim) {
+                    let bits = LittleEndian::read_u16(&bytes[off..off + 2]);
+                    vectors[i] = lut[bits as usize];
+                    off += 2;
+                }
+                Ok((row_ids, vectors))
+            }
+            PostingCodec::RowIdDeltaVarintV1F16 => {
+                if bytes.len() < 8 {
+                    bail!("posting_list(delta-varint+f16) chunk too small");
+                }
+                let count = LittleEndian::read_u32(&bytes[0..4]) as usize;
+                let mut cur = LittleEndian::read_u32(&bytes[4..8]);
+                let mut offset = 8usize;
+                let mut row_ids = Vec::<u32>::with_capacity(count);
+                if count > 0 {
+                    row_ids.push(cur);
+                    for _ in 1..count {
+                        let (delta, used) = decode_uleb128_u32(&bytes[offset..])?;
+                        offset += used;
+                        cur = cur.wrapping_add(delta);
+                        row_ids.push(cur);
+                    }
+                }
+                let vectors_bytes = count * dim * 2;
+                if bytes.len() != offset + vectors_bytes {
+                    bail!(
+                        "posting_list(delta-varint+f16) size mismatch: expected {} bytes, got {}",
+                        offset + vectors_bytes,
+                        bytes.len()
+                    );
+                }
+                let mut vectors = vec![0f32; count * dim];
+                let mut off = offset;
+                let lut = f16_lut();
+                for i in 0..(count * dim) {
+                    let bits = LittleEndian::read_u16(&bytes[off..off + 2]);
+                    vectors[i] = lut[bits as usize];
+                    off += 2;
+                }
+                Ok((row_ids, vectors))
+            }
+        }
+    }
+
+    pub fn read_posting_list_from_file(
+        &self,
+        file: &File,
+        list_id: u32,
+    ) -> Result<(Vec<u32>, Vec<f32>)> {
+        let desc = self.find_chunk(ChunkType::PostingList, Some(list_id))?;
+        let bytes = self.read_chunk_bytes_from_file(file, desc)?;
+        let dim = self.footer.dim as usize;
+        match desc.codec {
+            PostingCodec::Raw => {
+                if bytes.len() < 4 {
+                    bail!("posting_list chunk too small");
+                }
+                let count = LittleEndian::read_u32(&bytes[0..4]) as usize;
+                let row_ids_bytes = 4 + count * 4;
+                let vectors_bytes = count * dim * 4;
+                let expected = row_ids_bytes + vectors_bytes;
+                if bytes.len() != expected {
+                    bail!(
+                        "posting_list size mismatch: expected {expected} bytes, got {}",
+                        bytes.len()
+                    );
+                }
+                let mut row_ids = vec![0u32; count];
+                LittleEndian::read_u32_into(&bytes[4..row_ids_bytes], &mut row_ids);
+                let mut vectors = vec![0f32; count * dim];
+                LittleEndian::read_f32_into(&bytes[row_ids_bytes..], &mut vectors);
+                Ok((row_ids, vectors))
+            }
+            PostingCodec::RowIdDeltaVarintV1 => {
+                if bytes.len() < 8 {
+                    bail!("posting_list(delta-varint) chunk too small");
+                }
+                let count = LittleEndian::read_u32(&bytes[0..4]) as usize;
+                let dim = self.footer.dim as usize;
+                let mut cur = LittleEndian::read_u32(&bytes[4..8]);
+                let mut offset = 8usize;
+                let mut row_ids = Vec::<u32>::with_capacity(count);
+                if count > 0 {
+                    row_ids.push(cur);
+                    for _ in 1..count {
+                        let (delta, used) = decode_uleb128_u32(&bytes[offset..])?;
+                        offset += used;
+                        cur = cur.wrapping_add(delta);
+                        row_ids.push(cur);
+                    }
+                }
+                let vectors_bytes = count * dim * 4;
+                if bytes.len() != offset + vectors_bytes {
+                    bail!(
+                        "posting_list(delta-varint) size mismatch: expected {} bytes, got {}",
+                        offset + vectors_bytes,
+                        bytes.len()
+                    );
+                }
+                let mut vectors = vec![0f32; count * dim];
+                LittleEndian::read_f32_into(&bytes[offset..], &mut vectors);
+                Ok((row_ids, vectors))
+            }
+            PostingCodec::RawF16 => {
+                if bytes.len() < 4 {
+                    bail!("posting_list(f16) chunk too small");
+                }
+                let count = LittleEndian::read_u32(&bytes[0..4]) as usize;
+                let row_ids_bytes = 4 + count * 4;
+                let vectors_bytes = count * dim * 2;
+                let expected = row_ids_bytes + vectors_bytes;
+                if bytes.len() != expected {
+                    bail!(
+                        "posting_list(f16) size mismatch: expected {expected} bytes, got {}",
+                        bytes.len()
+                    );
+                }
+                let mut row_ids = vec![0u32; count];
+                LittleEndian::read_u32_into(&bytes[4..row_ids_bytes], &mut row_ids);
+                let mut vectors = vec![0f32; count * dim];
+                let mut off = row_ids_bytes;
+                let lut = f16_lut();
+                for i in 0..(count * dim) {
+                    let bits = LittleEndian::read_u16(&bytes[off..off + 2]);
+                    vectors[i] = lut[bits as usize];
+                    off += 2;
+                }
+                Ok((row_ids, vectors))
+            }
+            PostingCodec::RowIdDeltaVarintV1F16 => {
+                if bytes.len() < 8 {
+                    bail!("posting_list(delta-varint+f16) chunk too small");
+                }
+                let count = LittleEndian::read_u32(&bytes[0..4]) as usize;
+                let mut cur = LittleEndian::read_u32(&bytes[4..8]);
+                let mut offset = 8usize;
+                let mut row_ids = Vec::<u32>::with_capacity(count);
+                if count > 0 {
+                    row_ids.push(cur);
+                    for _ in 1..count {
+                        let (delta, used) = decode_uleb128_u32(&bytes[offset..])?;
+                        offset += used;
+                        cur = cur.wrapping_add(delta);
+                        row_ids.push(cur);
+                    }
+                }
+                let vectors_bytes = count * dim * 2;
+                if bytes.len() != offset + vectors_bytes {
+                    bail!(
+                        "posting_list(delta-varint+f16) size mismatch: expected {} bytes, got {}",
+                        offset + vectors_bytes,
+                        bytes.len()
+                    );
+                }
+                let mut vectors = vec![0f32; count * dim];
+                let mut off = offset;
+                let lut = f16_lut();
+                for i in 0..(count * dim) {
+                    let bits = LittleEndian::read_u16(&bytes[off..off + 2]);
+                    vectors[i] = lut[bits as usize];
+                    off += 2;
+                }
                 Ok((row_ids, vectors))
             }
         }
@@ -518,14 +793,13 @@ fn write_ivf_flat_artifact_file(
         let count = end.saturating_sub(start);
         let offset = w.stream_position()?;
 
-        let vectors_slice = &index.vectors[start * dim..end * dim];
-        let mut vectors_buf = vec![0u8; count * dim * 4];
-        LittleEndian::write_f32_into(vectors_slice, &mut vectors_buf);
-
         let mut encoded = Vec::<u8>::new();
         let raw_len: u64;
         match artifact_options.posting_codec {
             PostingCodec::Raw => {
+                let vectors_slice = &index.vectors[start * dim..end * dim];
+                let mut vectors_buf = vec![0u8; count * dim * 4];
+                LittleEndian::write_f32_into(vectors_slice, &mut vectors_buf);
                 encoded.reserve(4 + count * 4 + vectors_buf.len());
                 let mut header = [0u8; 4];
                 LittleEndian::write_u32(&mut header, count as u32);
@@ -538,6 +812,9 @@ fn write_ivf_flat_artifact_file(
                 raw_len = encoded.len() as u64;
             }
             PostingCodec::RowIdDeltaVarintV1 => {
+                let vectors_slice = &index.vectors[start * dim..end * dim];
+                let mut vectors_buf = vec![0u8; count * dim * 4];
+                LittleEndian::write_f32_into(vectors_slice, &mut vectors_buf);
                 encoded.reserve(8 + count * 2 + vectors_buf.len());
                 let mut header = [0u8; 4];
                 LittleEndian::write_u32(&mut header, count as u32);
@@ -553,6 +830,46 @@ fn write_ivf_flat_artifact_file(
                 }
                 let row_ids_raw_len = 4 + count * 4;
                 raw_len = (row_ids_raw_len + vectors_buf.len()) as u64;
+                encoded.extend_from_slice(&vectors_buf);
+            }
+            PostingCodec::RawF16 => {
+                let vectors_slice = &index.vectors[start * dim..end * dim];
+                let mut vectors_buf = Vec::<u8>::with_capacity(count * dim * 2);
+                for &x in vectors_slice {
+                    vectors_buf.extend_from_slice(&f16::from_f32(x).to_bits().to_le_bytes());
+                }
+                encoded.reserve(4 + count * 4 + vectors_buf.len());
+                let mut header = [0u8; 4];
+                LittleEndian::write_u32(&mut header, count as u32);
+                encoded.extend_from_slice(&header);
+                let row_ids_slice = &index.row_ids[start..end];
+                let mut row_ids_buf = vec![0u8; count * 4];
+                LittleEndian::write_u32_into(row_ids_slice, &mut row_ids_buf);
+                encoded.extend_from_slice(&row_ids_buf);
+                encoded.extend_from_slice(&vectors_buf);
+                raw_len = (4 + count * 4 + count * dim * 4) as u64;
+            }
+            PostingCodec::RowIdDeltaVarintV1F16 => {
+                let vectors_slice = &index.vectors[start * dim..end * dim];
+                let mut vectors_buf = Vec::<u8>::with_capacity(count * dim * 2);
+                for &x in vectors_slice {
+                    vectors_buf.extend_from_slice(&f16::from_f32(x).to_bits().to_le_bytes());
+                }
+                encoded.reserve(8 + count * 2 + vectors_buf.len());
+                let mut header = [0u8; 4];
+                LittleEndian::write_u32(&mut header, count as u32);
+                encoded.extend_from_slice(&header);
+                let row_ids_slice = &index.row_ids[start..end];
+                let first = row_ids_slice.first().copied().unwrap_or(0);
+                let mut first_buf = [0u8; 4];
+                LittleEndian::write_u32(&mut first_buf, first);
+                encoded.extend_from_slice(&first_buf);
+                for wpair in row_ids_slice.windows(2) {
+                    let delta = wpair[1].wrapping_sub(wpair[0]);
+                    encode_uleb128_u32(delta, &mut encoded);
+                }
+                let row_ids_raw_len = 4 + count * 4;
+                raw_len = (row_ids_raw_len + count * dim * 4) as u64;
                 encoded.extend_from_slice(&vectors_buf);
             }
         }
@@ -670,4 +987,85 @@ pub fn search_ivf_flat_artifact_native(
         .collect::<Vec<_>>();
     out.sort_by(|a, b| a.distance.total_cmp(&b.distance));
     Ok(out)
+}
+
+pub struct IvfFlatArtifactSearcher {
+    artifact: IvfFlatArtifact,
+    file: File,
+    centroids: Vec<f32>,
+}
+
+impl IvfFlatArtifactSearcher {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let artifact = IvfFlatArtifact::open(path)?;
+        let file = artifact.open_data_file()?;
+        let centroids = artifact.read_centroids_f32_from_file(&file)?;
+        Ok(Self {
+            artifact,
+            file,
+            centroids,
+        })
+    }
+
+    pub fn artifact(&self) -> &IvfFlatArtifact {
+        &self.artifact
+    }
+
+    pub fn search(&self, query: &[f32], k: usize, nprobe: usize) -> Result<Vec<SearchResult>> {
+        let footer = self.artifact.footer();
+        let dim = footer.dim as usize;
+        let nlist = footer.nlist as usize;
+        if query.len() != dim {
+            bail!("query dim mismatch: expected {dim}, got {}", query.len());
+        }
+        if k == 0 {
+            return Ok(vec![]);
+        }
+        let nprobe = nprobe.min(nlist).max(1);
+
+        if self.centroids.len() != nlist * dim {
+            bail!("centroids len mismatch");
+        }
+
+        let mut centroid_dists: Vec<(usize, f32)> = (0..nlist)
+            .map(|cid| {
+                let c = &self.centroids[cid * dim..(cid + 1) * dim];
+                (cid, crate::ivf_flat::l2_sq(query, c))
+            })
+            .collect();
+        centroid_dists.select_nth_unstable_by(nprobe - 1, |a, b| a.1.total_cmp(&b.1));
+        centroid_dists.truncate(nprobe);
+
+        let mut heap: std::collections::BinaryHeap<(ordered_float::NotNan<f32>, u32)> =
+            std::collections::BinaryHeap::new();
+        for (cid, _) in centroid_dists {
+            let (row_ids, vectors) = self.artifact.read_posting_list_from_file(&self.file, cid as u32)?;
+            for (pos, &row_id) in row_ids.iter().enumerate() {
+                let start = pos * dim;
+                let v = &vectors[start..start + dim];
+                let dist = crate::ivf_flat::l2_sq(query, v);
+                let dist_nn = ordered_float::NotNan::new(dist)
+                    .map_err(|_| anyhow::anyhow!("distance is NaN"))?;
+                if heap.len() < k {
+                    heap.push((dist_nn, row_id));
+                } else if let Some(&(worst, _)) = heap.peek() {
+                    if dist_nn < worst {
+                        heap.pop();
+                        heap.push((dist_nn, row_id));
+                    }
+                }
+            }
+        }
+
+        let mut out = heap
+            .into_sorted_vec()
+            .into_iter()
+            .map(|(distance, row_id)| SearchResult {
+                row_id,
+                distance: distance.into_inner(),
+            })
+            .collect::<Vec<_>>();
+        out.sort_by(|a, b| a.distance.total_cmp(&b.distance));
+        Ok(out)
+    }
 }

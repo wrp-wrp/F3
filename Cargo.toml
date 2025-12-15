@@ -33,6 +33,7 @@ members = [
     "wasm-libs/test-size",
     "wasm-libs/test-wmemcheck",
     "wasm-libs/adv-ude-fff",
+    "wasm-libs/ivf-kernel-basic",
 ]
 resolver = "2"
 

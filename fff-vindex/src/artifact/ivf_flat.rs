@@ -156,6 +156,26 @@ impl IvfFlatArtifact {
         Ok(buf)
     }
 
+    pub(crate) fn read_chunk_bytes_by_index(&self, chunk_id: u32) -> Result<Vec<u8>> {
+        let idx = chunk_id as usize;
+        let desc = self
+            .footer
+            .chunks
+            .get(idx)
+            .ok_or_else(|| anyhow::anyhow!("chunk_id out of range: {chunk_id}"))?;
+        self.read_chunk_bytes(desc)
+    }
+
+    pub(crate) fn find_chunk_id(&self, chunk_type: ChunkType, list_id: Option<u32>) -> Result<u32> {
+        let idx = self
+            .footer
+            .chunks
+            .iter()
+            .position(|c| c.chunk_type == chunk_type && c.list_id == list_id)
+            .ok_or_else(|| anyhow::anyhow!("chunk not found: {:?} {:?}", chunk_type, list_id))?;
+        Ok(idx as u32)
+    }
+
     pub fn read_centroids_f32(&self) -> Result<Vec<f32>> {
         let desc = self.find_chunk(ChunkType::Centroids, None)?;
         let bytes = self.read_chunk_bytes(desc)?;

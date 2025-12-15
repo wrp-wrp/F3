@@ -6,6 +6,7 @@ use fff_poc::reader::{FileReaderV2Builder, Projection, Selection};
 use fff_vindex::artifact::ivf_flat::{
     build_ivf_flat_artifact, load_ivf_flat_artifact, search_ivf_flat_artifact_native,
 };
+use fff_vindex::artifact::wasm_ivf_flat::WasmIvfFlatKernel;
 use fff_vindex::ivf_flat::{
     build_ivf_flat_sidecar, load_ivf_flat_index, search_ivf_flat, IvfFlatBuildOptions,
 };
@@ -50,6 +51,10 @@ struct Args {
     /// Build and query the IVF artifact container instead of the legacy ivf_flat file.
     #[arg(long, default_value_t = false)]
     artifact: bool,
+
+    /// Run IVF search via a Wasm kernel (path to the `.wasm` module). Implies `--artifact`.
+    #[arg(long)]
+    artifact_wasm_kernel: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
@@ -64,7 +69,22 @@ fn main() -> Result<()> {
         max_kmeans_iters: args.max_kmeans_iters,
     };
 
-    let (index_path, results) = if args.artifact {
+    let (index_path, results) = if let Some(wasm_path) = &args.artifact_wasm_kernel {
+        let index_path = build_ivf_flat_artifact(
+            &args.base_f3,
+            args.vector_leaf_index,
+            args.dim,
+            &args.index_name,
+            build_opts,
+        )
+        .with_context(|| "build ivf-flat artifact")?;
+        let artifact = load_ivf_flat_artifact(&index_path)?;
+        let artifact = Arc::new(artifact);
+        let mut kernel = WasmIvfFlatKernel::load(wasm_path, Arc::clone(&artifact))
+            .with_context(|| "load wasm ivf-flat kernel")?;
+        let results = kernel.search(&artifact, &query, args.k, args.nprobe)?;
+        (index_path, results)
+    } else if args.artifact {
         let index_path = build_ivf_flat_artifact(
             &args.base_f3,
             args.vector_leaf_index,

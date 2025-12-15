@@ -1,0 +1,214 @@
+use ordered_float::NotNan;
+use std::alloc::{alloc, dealloc, Layout};
+use std::cmp::Ordering;
+
+#[link(wasm_import_module = "env")]
+extern "C" {
+    fn host_chunk_len(chunk_id: u32) -> u32;
+    fn host_read_chunk(chunk_id: u32, dst_ptr: u32, dst_len: u32) -> u32;
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn alloc_ffi(len: u32, align: u32) -> u32 {
+    if len == 0 {
+        return 0;
+    }
+    let Ok(layout) = Layout::from_size_align(len as usize, align as usize) else {
+        return 0;
+    };
+    let ptr = alloc(layout);
+    ptr as u32
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dealloc_ffi(ptr: u32, len: u32, align: u32) {
+    if ptr == 0 || len == 0 {
+        return;
+    }
+    let Ok(layout) = Layout::from_size_align(len as usize, align as usize) else {
+        return;
+    };
+    dealloc(ptr as *mut u8, layout);
+}
+
+#[repr(C)]
+struct Pair {
+    row_id: u32,
+    dist: NotNan<f32>,
+}
+
+impl Eq for Pair {}
+
+impl PartialEq for Pair {
+    fn eq(&self, other: &Self) -> bool {
+        self.dist == other.dist && self.row_id == other.row_id
+    }
+}
+
+impl Ord for Pair {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Max-heap by distance (worst first), tie-break by row_id for stability.
+        self.dist
+            .cmp(&other.dist)
+            .then_with(|| self.row_id.cmp(&other.row_id))
+    }
+}
+
+impl PartialOrd for Pair {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn read_u32_le(buf: &[u8], offset: usize) -> Option<u32> {
+    buf.get(offset..offset + 4)
+        .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+}
+
+fn l2_sq(a: &[f32], b: &[f32]) -> f32 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| {
+            let d = x - y;
+            d * d
+        })
+        .sum()
+}
+
+unsafe fn fetch_chunk(chunk_id: u32) -> Option<Vec<u8>> {
+    let len = host_chunk_len(chunk_id);
+    if len == 0 {
+        return None;
+    }
+    let mut buf = Vec::<u8>::with_capacity(len as usize);
+    buf.set_len(len as usize);
+    let got = host_read_chunk(chunk_id, buf.as_mut_ptr() as u32, len);
+    if got != len {
+        return None;
+    }
+    Some(buf)
+}
+
+/// Directory layout (little-endian):
+/// - dim: u32
+/// - nlist: u32
+/// - centroids_chunk_id: u32
+/// - reserved: u32
+/// - posting_chunk_ids: u32[nlist] (index by list_id)
+///
+/// Query layout:
+/// - query: f32[dim]
+///
+/// Output layout:
+/// - repeated (row_id:u32, dist_bits:u32) for up to `k` results.
+#[no_mangle]
+pub unsafe extern "C" fn ivf_flat_search_ffi(
+    dir_ptr: u32,
+    dir_len: u32,
+    query_ptr: u32,
+    dim: u32,
+    k: u32,
+    nprobe: u32,
+    out_ptr: u32,
+    out_cap: u32,
+) -> u32 {
+    if k == 0 || out_cap == 0 {
+        return 0;
+    }
+    if dir_ptr == 0 || query_ptr == 0 || out_ptr == 0 {
+        return 0;
+    }
+
+    let dir = std::slice::from_raw_parts(dir_ptr as *const u8, dir_len as usize);
+    if dir.len() < 16 {
+        return 0;
+    }
+    let dir_dim = read_u32_le(dir, 0).unwrap();
+    let nlist = read_u32_le(dir, 4).unwrap();
+    let centroids_chunk_id = read_u32_le(dir, 8).unwrap();
+    if dir_dim != dim || nlist == 0 {
+        return 0;
+    }
+    let needed = 16usize + (nlist as usize) * 4;
+    if dir.len() < needed {
+        return 0;
+    }
+    let posting_ids_bytes = &dir[16..16 + (nlist as usize) * 4];
+    let posting_chunk_ids: &[u32] = std::slice::from_raw_parts(
+        posting_ids_bytes.as_ptr() as *const u32,
+        nlist as usize,
+    );
+
+    let query = std::slice::from_raw_parts(query_ptr as *const f32, dim as usize);
+
+    let centroids_bytes = match fetch_chunk(centroids_chunk_id) {
+        Some(b) => b,
+        None => return 0,
+    };
+    if centroids_bytes.len() != (nlist as usize) * (dim as usize) * 4 {
+        return 0;
+    }
+    let centroids: &[f32] = std::slice::from_raw_parts(
+        centroids_bytes.as_ptr() as *const f32,
+        (nlist as usize) * (dim as usize),
+    );
+
+    // Pick nprobe lists.
+    let mut centroid_dists = Vec::<(u32, f32)>::with_capacity(nlist as usize);
+    for cid in 0..nlist as usize {
+        let c = &centroids[cid * dim as usize..(cid + 1) * dim as usize];
+        centroid_dists.push((cid as u32, l2_sq(query, c)));
+    }
+    let nprobe = nprobe.clamp(1, nlist);
+    centroid_dists.select_nth_unstable_by((nprobe - 1) as usize, |a, b| a.1.total_cmp(&b.1));
+    centroid_dists.truncate(nprobe as usize);
+
+    let mut heap = std::collections::BinaryHeap::<Pair>::new();
+    let k = k.min(out_cap) as usize;
+    for (cid, _) in centroid_dists {
+        let posting_chunk_id = posting_chunk_ids.get(cid as usize).copied().unwrap_or(0);
+        if posting_chunk_id == 0 {
+            continue;
+        }
+        let bytes = match fetch_chunk(posting_chunk_id) {
+            Some(b) => b,
+            None => continue,
+        };
+        if bytes.len() < 4 {
+            continue;
+        }
+        let count = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+        let row_ids_bytes = 4 + count * 4;
+        let vectors_bytes = count * dim as usize * 4;
+        if bytes.len() != row_ids_bytes + vectors_bytes {
+            continue;
+        }
+        let row_ids: &[u32] = std::slice::from_raw_parts(bytes[4..row_ids_bytes].as_ptr() as *const u32, count);
+        let vectors: &[f32] = std::slice::from_raw_parts(bytes[row_ids_bytes..].as_ptr() as *const f32, count * dim as usize);
+        for (pos, &row_id) in row_ids.iter().enumerate() {
+            let v = &vectors[pos * dim as usize..(pos + 1) * dim as usize];
+            let dist = l2_sq(query, v);
+            let Ok(dist_nn) = NotNan::new(dist) else { continue };
+            if heap.len() < k {
+                heap.push(Pair { row_id, dist: dist_nn });
+            } else if let Some(worst) = heap.peek() {
+                if dist_nn < worst.dist {
+                    let _ = heap.pop();
+                    heap.push(Pair { row_id, dist: dist_nn });
+                }
+            }
+        }
+    }
+
+    let mut out = heap.into_vec();
+    out.sort_by(|a, b| a.dist.cmp(&b.dist).then_with(|| a.row_id.cmp(&b.row_id)));
+    let out_n = out.len().min(k) as u32;
+
+    let out_words = std::slice::from_raw_parts_mut(out_ptr as *mut u32, (out_cap as usize) * 2);
+    for (i, pair) in out.into_iter().take(out_n as usize).enumerate() {
+        out_words[i * 2] = pair.row_id;
+        out_words[i * 2 + 1] = pair.dist.into_inner().to_bits();
+    }
+    out_n
+}
+

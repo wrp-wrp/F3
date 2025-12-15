@@ -1,0 +1,11 @@
+[package]
+name = "ivf-kernel-basic"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+ordered-float = "4.5.0"
+

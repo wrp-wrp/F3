@@ -13,6 +13,7 @@ arrow = { workspace = true }
 rand = { workspace = true }
 byteorder = { workspace = true }
 ordered-float = "4.5.0"
+wasmtime = { workspace = true }
 
 fff-poc = { path = "../fff-poc" }
 fff-format = { path = "../fff-format" }

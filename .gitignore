@@ -10,6 +10,7 @@ data/sift/
 results/sift_ivf_artifact_*/
 results/sift_ivf_aligned_*/
 results/sift_ivf_aligned_profile_*/
+results/sift_ivf_aligned_profile_strict_*/
 
 # for storing aws credentials
 .env 

@@ -104,8 +104,11 @@ Wasm 的每次迭代 JSON 行现在包含这些字段（来自 `vector_ivf_flat_
 - native artifact：通过 `IvfFlatArtifactSearcher::search_profiled()` 输出 `centroid_ms / decode_ms / dist_ms / heap_ms`
 - wasm artifact：kernel 侧通过 `ivf_last_stats_v2_ffi` 输出同名字段；host 侧仍输出 `fetch_ms / transfer_ms`
 
-脚本：`bash scripts/run_sift_ivf_aligned_profile.sh`  
+脚本（warm only，便于快速定位瓶颈）：`bash scripts/run_sift_ivf_aligned_profile.sh`  
 本地结果目录（一次样例）：`results/sift_ivf_aligned_profile_20251216_001400/`
+
+脚本（strict cold/warm，对齐缓存策略）：`bash scripts/run_sift_ivf_aligned_profile_strict.sh`  
+本地结果目录：`results/sift_ivf_aligned_profile_strict_YYYYMMDD_HHMMSS/`
 
 > 注意：stage profiling 会把距离计算与 heap 更新拆成多 pass，会额外引入开销；它的用途是“时间归因”，不是“峰值性能”。
 
@@ -163,6 +166,14 @@ Wasm 的每次迭代 JSON 行现在包含这些字段（来自 `vector_ivf_flat_
 | native_f16_cold | raw_f16 | posting_cache=off | 26,041,127 | 102.289 | - | - | - | - | - |
 | wasm_f16_warm | raw_f16 | host_cache=on + kernel_decoded_cache=on | 26,041,127 | 50.215 | 0.000 | 0.001 | 0.000 | 50.046 | 0 |
 | wasm_f16_cold | raw_f16 | host_cache=off + kernel_decoded_cache=off | 26,041,127 | 158.466 | 10.784 | 17.629 | 90.911 | 49.116 | 513 |
+
+#### 严格对齐 Stage profiling 结果（SIFT100K，nq=32，p50 over iterations）
+
+该表来自 `bash scripts/run_sift_ivf_aligned_profile_strict.sh`（每个 case 都开启 `--profile-stages`），因此 native 侧也会给出 `centroid/decode/dist/heap`，Wasm 侧同时给出 `fetch/transfer/decode/compute`。
+
+| case | codec | cache | p50_wall_ms | p50_fetch_ms | p50_transfer_ms | p50_centroid_ms | p50_decode_ms | p50_dist_ms | p50_heap_ms | p50_compute_ms |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| （运行后会写到 `results/sift_ivf_aligned_profile_strict_*/`，再用 `python3 scripts/summarize_ivf_jsonl.py <dir> --format json` 填表） |  |  |  |  |  |  |  |  |  |  |
 
 
 ### Size 拆分（同一份 index 文件）

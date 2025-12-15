@@ -16,6 +16,7 @@ log = { workspace = true }
 humansize = { workspace = true }
 fs_extra = { workspace = true }
 arrow = { workspace = true }
+arrow-schema = { workspace = true }
 futures = { workspace = true }
 clap = { workspace = true }
 wasmtime = { workspace = true }
@@ -28,6 +29,7 @@ fff-core = { path = "../fff-core" }
 fff-format = { path = "../fff-format" }
 tempfile = { workspace = true }
 flatbuffers = { workspace = true }
+byteorder = { workspace = true }
 
 arrow-array = { workspace = true }
 vortex-sampling-compressor = { workspace = true }

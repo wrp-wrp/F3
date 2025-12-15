@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
+use wasi_common::sync::WasiCtxBuilder;
 use wasmtime::{Caller, Engine, Linker, Memory, Module, Store, TypedFunc};
 
 #[derive(Default)]
@@ -15,6 +16,11 @@ struct HostState {
     raw_lens: Vec<u64>,
     stats: FetchStats,
     cache_enabled: bool,
+}
+
+struct WasmState {
+    wasi: wasi_common::WasiCtx,
+    host: HostState,
 }
 
 impl HostState {
@@ -119,7 +125,7 @@ impl FetchStats {
 }
 
 pub struct WasmIvfFlatKernel {
-    store: Store<HostState>,
+    store: Store<WasmState>,
     memory: Memory,
     alloc: TypedFunc<(u32, u32), u32>,
     dealloc: TypedFunc<(u32, u32, u32), ()>,
@@ -132,10 +138,11 @@ impl WasmIvfFlatKernel {
         let module = Module::from_file(&engine, wasm_path.as_ref())
             .with_context(|| format!("load wasm {}", wasm_path.as_ref().display()))?;
 
-        let mut linker = Linker::<HostState>::new(&engine);
+        let mut linker = Linker::<WasmState>::new(&engine);
+        wasi_common::sync::add_to_linker(&mut linker, |s| &mut s.wasi)?;
 
-        linker.func_wrap("env", "host_chunk_len", |mut caller: Caller<'_, HostState>, chunk_id: u32| -> u32 {
-            let state = caller.data_mut();
+        linker.func_wrap("env", "host_chunk_len", |mut caller: Caller<'_, WasmState>, chunk_id: u32| -> u32 {
+            let state = &mut caller.data_mut().host;
             match state.chunk_len(chunk_id) {
                 Ok(len) => len,
                 Err(_) => 0,
@@ -145,7 +152,7 @@ impl WasmIvfFlatKernel {
         linker.func_wrap(
             "env",
             "host_read_chunk",
-            |mut caller: Caller<'_, HostState>, chunk_id: u32, dst_ptr: u32, dst_len: u32| -> u32 {
+            |mut caller: Caller<'_, WasmState>, chunk_id: u32, dst_ptr: u32, dst_len: u32| -> u32 {
                 let res: Result<u32> = (|| {
                     let mem = caller
                         .get_export("memory")
@@ -153,7 +160,7 @@ impl WasmIvfFlatKernel {
                         .ok_or_else(|| anyhow::anyhow!("wasm export `memory` not found"))?;
                     let mut tmp = vec![0u8; dst_len as usize];
                     let n = {
-                        let state = caller.data_mut();
+                        let state = &mut caller.data_mut().host;
                         state.read_chunk_into(chunk_id, &mut tmp)?
                     };
                     if n == 0 {
@@ -166,8 +173,15 @@ impl WasmIvfFlatKernel {
             },
         )?;
 
-        let mut store = Store::new(&engine, HostState::default());
-        store.data_mut().set_artifact(artifact);
+        let wasi = WasiCtxBuilder::new().inherit_stdio().build();
+        let mut store = Store::new(
+            &engine,
+            WasmState {
+                wasi,
+                host: HostState::default(),
+            },
+        );
+        store.data_mut().host.set_artifact(artifact);
 
         let instance = linker
             .instantiate(&mut store, &module)
@@ -200,18 +214,18 @@ impl WasmIvfFlatKernel {
     }
 
     pub fn reset_stats(&mut self) {
-        self.store.data_mut().stats = FetchStats::default();
+        self.store.data_mut().host.stats = FetchStats::default();
     }
 
     pub fn set_cache_enabled(&mut self, enabled: bool) {
-        self.store.data_mut().cache_enabled = enabled;
+        self.store.data_mut().host.cache_enabled = enabled;
         if !enabled {
-            self.store.data_mut().cache.clear();
+            self.store.data_mut().host.cache.clear();
         }
     }
 
     pub fn stats(&self) -> FetchStats {
-        self.store.data().stats.clone()
+        self.store.data().host.stats.clone()
     }
 
     pub fn search(
@@ -384,7 +398,7 @@ impl WasmIvfFlatKernel {
         self.dealloc
             .call(&mut self.store, (counts_ptr, counts_len_bytes as u32, 4))?;
 
-        self.store.data_mut().stats.total_time_ns = total_time_ns;
+        self.store.data_mut().host.stats.total_time_ns = total_time_ns;
 
         Ok(results)
     }

@@ -6,6 +6,7 @@ __pycache__
 build
 data_*
 data/sift/
+results/sift_ivf_artifact_*/
 
 # for storing aws credentials
 .env 

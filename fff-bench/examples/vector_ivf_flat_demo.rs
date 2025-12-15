@@ -115,6 +115,23 @@ fn main() -> Result<()> {
             IvfFlatArtifactBuildOptions { posting_codec },
         )
         .with_context(|| "build ivf-flat artifact")?;
+        if args.json {
+            let index_bytes = std::fs::metadata(&index_path).map(|m| m.len()).unwrap_or(0);
+            println!(
+                "{}",
+                json!({
+                    "event": "meta",
+                    "engine": "wasm",
+                    "index_path": index_path.to_string_lossy(),
+                    "index_bytes": index_bytes,
+                    "nq": args.nq,
+                    "k": args.k,
+                    "nprobe": args.nprobe,
+                    "posting_codec": args.artifact_posting_codec,
+                    "cache_enabled": !args.artifact_wasm_no_cache,
+                })
+            );
+        }
         let artifact = load_ivf_flat_artifact(&index_path)?;
         let artifact = Arc::new(artifact);
         let mut kernel = WasmIvfFlatKernel::load(wasm_path, Arc::clone(&artifact))
@@ -201,6 +218,22 @@ fn main() -> Result<()> {
             IvfFlatArtifactBuildOptions { posting_codec },
         )
         .with_context(|| "build ivf-flat artifact")?;
+        if args.json {
+            let index_bytes = std::fs::metadata(&index_path).map(|m| m.len()).unwrap_or(0);
+            println!(
+                "{}",
+                json!({
+                    "event": "meta",
+                    "engine": "native_artifact",
+                    "index_path": index_path.to_string_lossy(),
+                    "index_bytes": index_bytes,
+                    "nq": args.nq,
+                    "k": args.k,
+                    "nprobe": args.nprobe,
+                    "posting_codec": args.artifact_posting_codec,
+                })
+            );
+        }
         let artifact = load_ivf_flat_artifact(&index_path)?;
         for _ in 0..args.warmup {
             for q in 0..args.nq {
@@ -243,6 +276,21 @@ fn main() -> Result<()> {
             build_opts,
         )
         .with_context(|| "build ivf-flat index")?;
+        if args.json {
+            let index_bytes = std::fs::metadata(&index_path).map(|m| m.len()).unwrap_or(0);
+            println!(
+                "{}",
+                json!({
+                    "event": "meta",
+                    "engine": "native_sidecar",
+                    "index_path": index_path.to_string_lossy(),
+                    "index_bytes": index_bytes,
+                    "nq": args.nq,
+                    "k": args.k,
+                    "nprobe": args.nprobe,
+                })
+            );
+        }
         let index = load_ivf_flat_index(&index_path)?;
         for _ in 0..args.warmup {
             for q in 0..args.nq {

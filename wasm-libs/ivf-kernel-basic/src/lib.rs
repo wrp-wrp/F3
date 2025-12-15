@@ -764,10 +764,12 @@ pub unsafe extern "C" fn ivf_flat_search_batch_ffi(
                         bytes[row_ids_bytes..].as_ptr() as *const f32,
                         count * dim as usize,
                     );
+                    let start_compute = Instant::now();
                     for (pos, &row_id) in row_ids.iter().enumerate() {
                         let v = &vectors[pos * dim as usize..(pos + 1) * dim as usize];
                         heap_push_topk(&mut heap, k, row_id, l2_sq(query, v));
                     }
+                    compute_ns += start_compute.elapsed().as_nanos() as u64;
                 }
                 1 => {
                     if bytes.len() < 8 {
@@ -796,6 +798,7 @@ pub unsafe extern "C" fn ivf_flat_search_batch_ffi(
 
                     let mut cur_row = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
                     let mut off2 = 8usize;
+                    let start_compute = Instant::now();
                     for pos in 0..count {
                         if pos > 0 {
                             let Some((delta, used)) = decode_uleb128_u32(&bytes[off2..]) else {
@@ -807,6 +810,7 @@ pub unsafe extern "C" fn ivf_flat_search_batch_ffi(
                         let v = &vectors[pos * dim as usize..(pos + 1) * dim as usize];
                         heap_push_topk(&mut heap, k, cur_row, l2_sq(query, v));
                     }
+                    compute_ns += start_compute.elapsed().as_nanos() as u64;
                 }
                 2 => {
                     let row_ids_bytes = 4 + count * 4;
@@ -818,11 +822,13 @@ pub unsafe extern "C" fn ivf_flat_search_batch_ffi(
                         count,
                     );
                     let vectors_bytes = &bytes[row_ids_bytes..];
+                    let start_compute = Instant::now();
                     for (pos, &row_id) in row_ids.iter().enumerate() {
                         let off = pos * dim as usize * 2;
                         let v = &vectors_bytes[off..off + dim as usize * 2];
                         heap_push_topk(&mut heap, k, row_id, l2_sq_f16(query, v));
                     }
+                    compute_ns += start_compute.elapsed().as_nanos() as u64;
                 }
                 3 => {
                     if bytes.len() < 8 {
@@ -848,6 +854,7 @@ pub unsafe extern "C" fn ivf_flat_search_batch_ffi(
 
                     let mut cur_row = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
                     let mut off2 = 8usize;
+                    let start_compute = Instant::now();
                     for pos in 0..count {
                         if pos > 0 {
                             let Some((delta, used)) = decode_uleb128_u32(&bytes[off2..]) else {
@@ -860,6 +867,7 @@ pub unsafe extern "C" fn ivf_flat_search_batch_ffi(
                         let v = &vectors_bytes[off..off + dim as usize * 2];
                         heap_push_topk(&mut heap, k, cur_row, l2_sq_f16(query, v));
                     }
+                    compute_ns += start_compute.elapsed().as_nanos() as u64;
                 }
                 _ => continue,
             }

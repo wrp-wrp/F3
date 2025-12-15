@@ -53,7 +53,7 @@ Wasm 内核提供 batch API（一次传 `nq>1` 个 query），可以扫 `nq` 看
 ## 已跑结果（SIFT100K，最新一次）
 
 - 运行脚本：`bash scripts/run_sift_ivf_experiments.sh`
-- 本地结果目录：`results/sift_ivf_artifact_20251215_232708/`
+- 本地结果目录：`results/sift_ivf_artifact_20251215_233632/`
 - 汇总方式：对每个 `.jsonl` 的 `wall_ms` 取 p50/p95/p99（n=10）
 
 | case | index_bytes | p50_ms | p95_ms | p99_ms | 备注 |
@@ -74,8 +74,37 @@ Wasm 内核提供 batch API（一次传 `nq>1` 个 query），可以扫 `nq` 看
 说明：
 - `index_bytes` 目前下降很小，是因为 **只压了 row_id**，posting chunk 里的向量仍是 `f32` 原样存（体积大头在向量）。
 - `*_f16` codec 将 posting vectors 存为 `f16`，所以 index 大小约减半；native 路径由于 `IvfFlatArtifactSearcher` 缓存了已解码 posting（热），所以 p50 基本追平 `f32`。
-- Wasm 路径为了证明“动态解压在 Wasm 内也不慢”，新增了 **kernel 内 decoded cache + decode/compute breakdown**：在 warm 场景下 `decode_ms≈0`（解码在 warmup 完成），`compute_ms` 成为主要开销（见 `.jsonl` 每行的 `decode_ms/compute_ms/decoded_cache_*` 字段）。
+- Wasm 路径为了证明“动态解压在 Wasm 内也不慢”，新增了 **kernel 内 decoded cache + decode/compute breakdown**：在 warm 场景下 `decode_ms≈0`（解码在 warmup 完成），主要开销落在内核的计算阶段。
 - Wasm `nocache` 会显著增加 `fetch_ms / compressed_bytes_in`（见对应 `.jsonl` 的每行 stats 字段）。
+
+### “差距主要在 compute”是怎么证明的？
+
+Wasm 的每次迭代 JSON 行现在包含这些字段（来自 `vector_ivf_flat_demo`）：
+- `fetch_ms`：host 拉 chunk 的耗时（I/O）
+- `decode_ms`：Wasm 内核里 posting 解码耗时（主要用于 `*_f16` 的动态解压/解码）
+- `compute_ms`：Wasm 内核里遍历 posting + 距离计算（扫描阶段）的耗时
+- `kernel_total_ms`：Wasm 内核总耗时（包含 centroid 距离、heap/topk、扫描等所有内核工作）
+
+因此，在 **host cache 开启** 且 **kernel decoded cache 开启** 的 warm 场景下，如果观测到：
+- `fetch_ms≈0`
+- `decode_ms≈0`
+而 `kernel_total_ms` 仍显著大于 0，则剩余时间只能来自 **内核计算**（centroid 选择/heap/topk/距离扫描等）。
+
+一个具体例子（来自 `results/sift_ivf_artifact_20251215_233632/wasm_artifact_raw_f16_cache_nq32.jsonl`）：
+- `fetch_ms=0.0`，`decode_ms=0.0`
+- `compute_ms≈47.7ms`，`kernel_total_ms≈47.9ms`
+
+这说明在 warm 情况下，“动态解压”已经不再是瓶颈，差距主要来自计算（尤其是 posting 扫描 + 距离核）。
+
+### SIMD 公平性（论文里应该怎么做）
+
+你说得对：为了公平，SIMD 必须作为一个明确的实验维度，而不是“某边默认开、某边默认关”。
+
+建议论文报告两组设置（两边对齐）：
+- **Portable baseline（默认）**：native 不启用 `-C target-cpu=native`，Wasm 不使用 `simd128` 指令（保证可移植、对比更干净）。
+- **Optimized（对齐 SIMD）**：native 使用 `-C target-cpu=native`（或显式 AVX/NEON），Wasm 版本编译出 `simd128`（并确认 Wasmtime 支持 simd）。
+
+两组都报 `Recall@k` + `p50/p99 latency`，并在图注明确说明编译/运行配置（否则审稿人会认为不公平）。
 
 ### Size 拆分（同一份 index 文件）
 

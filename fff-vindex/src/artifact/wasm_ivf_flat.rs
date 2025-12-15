@@ -1,4 +1,4 @@
-use crate::artifact::ivf_flat::{ChunkType, IvfFlatArtifact};
+use crate::artifact::ivf_flat::{ChunkType, IvfFlatArtifact, PostingCodec};
 use crate::ivf_flat::SearchResult;
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
@@ -10,12 +10,16 @@ use wasmtime::{Caller, Engine, Linker, Memory, Module, Store, TypedFunc};
 struct HostState {
     artifact: Option<Arc<IvfFlatArtifact>>,
     cache: HashMap<u32, Vec<u8>>,
+    raw_lens: Vec<u64>,
+    stats: FetchStats,
 }
 
 impl HostState {
     fn set_artifact(&mut self, artifact: Arc<IvfFlatArtifact>) {
+        self.raw_lens = artifact.footer().chunks.iter().map(|c| c.raw_len).collect();
         self.artifact = Some(artifact);
         self.cache.clear();
+        self.stats = FetchStats::default();
     }
 
     fn get_or_load(&mut self, chunk_id: u32) -> Result<&[u8]> {
@@ -27,9 +31,21 @@ impl HostState {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("artifact not set in host state"))?;
         let bytes = artifact.read_chunk_bytes_by_index(chunk_id)?;
+        self.stats.chunks_fetched += 1;
+        self.stats.compressed_bytes_in += bytes.len() as u64;
+        if let Some(raw_len) = self.raw_lens.get(chunk_id as usize).copied() {
+            self.stats.raw_bytes_decoded += raw_len;
+        }
         self.cache.insert(chunk_id, bytes);
         Ok(self.cache.get(&chunk_id).unwrap().as_slice())
     }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct FetchStats {
+    pub chunks_fetched: u64,
+    pub compressed_bytes_in: u64,
+    pub raw_bytes_decoded: u64,
 }
 
 pub struct WasmIvfFlatKernel {
@@ -112,6 +128,14 @@ impl WasmIvfFlatKernel {
         })
     }
 
+    pub fn reset_stats(&mut self) {
+        self.store.data_mut().stats = FetchStats::default();
+    }
+
+    pub fn stats(&self) -> FetchStats {
+        self.store.data().stats
+    }
+
     pub fn search(
         &mut self,
         artifact: &IvfFlatArtifact,
@@ -130,6 +154,17 @@ impl WasmIvfFlatKernel {
 
         // Build directory buffer for wasm.
         let centroids_id = artifact.find_chunk_id(ChunkType::Centroids, None)?;
+        let posting_codec = artifact
+            .footer()
+            .chunks
+            .iter()
+            .find(|c| c.chunk_type == ChunkType::PostingList && c.list_id == Some(0))
+            .map(|c| c.codec)
+            .unwrap_or(PostingCodec::Raw);
+        let posting_codec_id: u32 = match posting_codec {
+            PostingCodec::Raw => 0,
+            PostingCodec::RowIdDeltaVarintV1 => 1,
+        };
         let mut posting_ids = vec![0u32; nlist];
         for list_id in 0..nlist {
             posting_ids[list_id] =
@@ -139,7 +174,7 @@ impl WasmIvfFlatKernel {
         dir.extend_from_slice(&(dim as u32).to_le_bytes());
         dir.extend_from_slice(&(nlist as u32).to_le_bytes());
         dir.extend_from_slice(&centroids_id.to_le_bytes());
-        dir.extend_from_slice(&0u32.to_le_bytes());
+        dir.extend_from_slice(&posting_codec_id.to_le_bytes());
         for id in posting_ids {
             dir.extend_from_slice(&id.to_le_bytes());
         }

@@ -65,6 +65,26 @@ fn read_u32_le(buf: &[u8], offset: usize) -> Option<u32> {
         .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
 }
 
+fn decode_uleb128_u32(mut input: &[u8]) -> Option<(u32, usize)> {
+    let mut value: u32 = 0;
+    let mut shift: u32 = 0;
+    let mut used = 0usize;
+    loop {
+        let b = *input.first()?;
+        input = &input[1..];
+        used += 1;
+        let low = (b & 0x7f) as u32;
+        value |= low.wrapping_shl(shift);
+        if (b & 0x80) == 0 {
+            return Some((value, used));
+        }
+        shift = shift.saturating_add(7);
+        if used > 5 {
+            return None;
+        }
+    }
+}
+
 fn l2_sq(a: &[f32], b: &[f32]) -> f32 {
     a.iter()
         .zip(b.iter())
@@ -93,7 +113,7 @@ unsafe fn fetch_chunk(chunk_id: u32) -> Option<Vec<u8>> {
 /// - dim: u32
 /// - nlist: u32
 /// - centroids_chunk_id: u32
-/// - reserved: u32
+/// - posting_codec: u32 (0=raw, 1=row_id_delta_varint_v1)
 /// - posting_chunk_ids: u32[nlist] (index by list_id)
 ///
 /// Query layout:
@@ -126,6 +146,7 @@ pub unsafe extern "C" fn ivf_flat_search_ffi(
     let dir_dim = read_u32_le(dir, 0).unwrap();
     let nlist = read_u32_le(dir, 4).unwrap();
     let centroids_chunk_id = read_u32_le(dir, 8).unwrap();
+    let posting_codec = read_u32_le(dir, 12).unwrap();
     if dir_dim != dim || nlist == 0 {
         return 0;
     }
@@ -178,25 +199,97 @@ pub unsafe extern "C" fn ivf_flat_search_ffi(
             continue;
         }
         let count = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
-        let row_ids_bytes = 4 + count * 4;
         let vectors_bytes = count * dim as usize * 4;
-        if bytes.len() != row_ids_bytes + vectors_bytes {
-            continue;
-        }
-        let row_ids: &[u32] = std::slice::from_raw_parts(bytes[4..row_ids_bytes].as_ptr() as *const u32, count);
-        let vectors: &[f32] = std::slice::from_raw_parts(bytes[row_ids_bytes..].as_ptr() as *const f32, count * dim as usize);
-        for (pos, &row_id) in row_ids.iter().enumerate() {
-            let v = &vectors[pos * dim as usize..(pos + 1) * dim as usize];
-            let dist = l2_sq(query, v);
-            let Ok(dist_nn) = NotNan::new(dist) else { continue };
-            if heap.len() < k {
-                heap.push(Pair { row_id, dist: dist_nn });
-            } else if let Some(worst) = heap.peek() {
-                if dist_nn < worst.dist {
-                    let _ = heap.pop();
-                    heap.push(Pair { row_id, dist: dist_nn });
+
+        match posting_codec {
+            0 => {
+                // raw: [count:u32][row_ids:u32*count][vectors]
+                let row_ids_bytes = 4 + count * 4;
+                if bytes.len() != row_ids_bytes + vectors_bytes {
+                    continue;
+                }
+                let row_ids: &[u32] = std::slice::from_raw_parts(
+                    bytes[4..row_ids_bytes].as_ptr() as *const u32,
+                    count,
+                );
+                let vectors: &[f32] = std::slice::from_raw_parts(
+                    bytes[row_ids_bytes..].as_ptr() as *const f32,
+                    count * dim as usize,
+                );
+                for (pos, &row_id) in row_ids.iter().enumerate() {
+                    let v = &vectors[pos * dim as usize..(pos + 1) * dim as usize];
+                    let dist = l2_sq(query, v);
+                    let Ok(dist_nn) = NotNan::new(dist) else {
+                        continue;
+                    };
+                    if heap.len() < k {
+                        heap.push(Pair { row_id, dist: dist_nn });
+                    } else if let Some(worst) = heap.peek() {
+                        if dist_nn < worst.dist {
+                            let _ = heap.pop();
+                            heap.push(Pair { row_id, dist: dist_nn });
+                        }
+                    }
                 }
             }
+            1 => {
+                // row_id_delta_varint_v1: [count:u32][first:u32][deltas:uleb128*(count-1)][vectors]
+                if bytes.len() < 8 {
+                    continue;
+                }
+                let mut offset = 8usize;
+                if count > 1 {
+                    for _ in 1..count {
+                        let Some((_, used)) = decode_uleb128_u32(&bytes[offset..]) else {
+                            offset = usize::MAX;
+                            break;
+                        };
+                        offset += used;
+                    }
+                }
+                if offset == usize::MAX {
+                    continue;
+                }
+                if bytes.len() != offset + vectors_bytes {
+                    continue;
+                }
+                let vectors: &[f32] = std::slice::from_raw_parts(
+                    bytes[offset..].as_ptr() as *const f32,
+                    count * dim as usize,
+                );
+
+                let mut cur_row = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+                let mut off2 = 8usize;
+                for pos in 0..count {
+                    if pos > 0 {
+                        let Some((delta, used)) = decode_uleb128_u32(&bytes[off2..]) else {
+                            break;
+                        };
+                        off2 += used;
+                        cur_row = cur_row.wrapping_add(delta);
+                    }
+                    let v = &vectors[pos * dim as usize..(pos + 1) * dim as usize];
+                    let dist = l2_sq(query, v);
+                    let Ok(dist_nn) = NotNan::new(dist) else {
+                        continue;
+                    };
+                    if heap.len() < k {
+                        heap.push(Pair {
+                            row_id: cur_row,
+                            dist: dist_nn,
+                        });
+                    } else if let Some(worst) = heap.peek() {
+                        if dist_nn < worst.dist {
+                            let _ = heap.pop();
+                            heap.push(Pair {
+                                row_id: cur_row,
+                                dist: dist_nn,
+                            });
+                        }
+                    }
+                }
+            }
+            _ => continue,
         }
     }
 
@@ -211,4 +304,3 @@ pub unsafe extern "C" fn ivf_flat_search_ffi(
     }
     out_n
 }
-

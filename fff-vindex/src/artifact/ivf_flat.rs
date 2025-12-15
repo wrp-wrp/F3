@@ -23,6 +23,13 @@ pub enum ChunkType {
     PostingList,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum PostingCodec {
+    Raw,
+    RowIdDeltaVarintV1,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChunkDesc {
     pub chunk_type: ChunkType,
@@ -31,7 +38,7 @@ pub struct ChunkDesc {
     pub offset: u64,
     pub len: u64,
     pub raw_len: u64,
-    pub codec: String,
+    pub codec: PostingCodec,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -144,9 +151,6 @@ impl IvfFlatArtifact {
     }
 
     fn read_chunk_bytes(&self, desc: &ChunkDesc) -> Result<Vec<u8>> {
-        if desc.codec != "raw" {
-            bail!("unsupported codec {}", desc.codec);
-        }
         let mut f = BufReader::new(
             File::open(&self.path).with_context(|| format!("open artifact {}", self.path.display()))?,
         );
@@ -201,25 +205,105 @@ impl IvfFlatArtifact {
     pub fn read_posting_list(&self, list_id: u32) -> Result<(Vec<u32>, Vec<f32>)> {
         let desc = self.find_chunk(ChunkType::PostingList, Some(list_id))?;
         let bytes = self.read_chunk_bytes(desc)?;
-        if bytes.len() < 4 {
-            bail!("posting_list chunk too small");
-        }
-        let count = LittleEndian::read_u32(&bytes[0..4]) as usize;
         let dim = self.footer.dim as usize;
-        let row_ids_bytes = 4 + count * 4;
-        let vectors_bytes = count * dim * 4;
-        let expected = row_ids_bytes + vectors_bytes;
-        if bytes.len() != expected {
-            bail!(
-                "posting_list size mismatch: expected {expected} bytes, got {}",
-                bytes.len()
-            );
+        match desc.codec {
+            PostingCodec::Raw => {
+                if bytes.len() < 4 {
+                    bail!("posting_list chunk too small");
+                }
+                let count = LittleEndian::read_u32(&bytes[0..4]) as usize;
+                let row_ids_bytes = 4 + count * 4;
+                let vectors_bytes = count * dim * 4;
+                let expected = row_ids_bytes + vectors_bytes;
+                if bytes.len() != expected {
+                    bail!(
+                        "posting_list size mismatch: expected {expected} bytes, got {}",
+                        bytes.len()
+                    );
+                }
+                let mut row_ids = vec![0u32; count];
+                LittleEndian::read_u32_into(&bytes[4..row_ids_bytes], &mut row_ids);
+                let mut vectors = vec![0f32; count * dim];
+                LittleEndian::read_f32_into(&bytes[row_ids_bytes..], &mut vectors);
+                Ok((row_ids, vectors))
+            }
+            PostingCodec::RowIdDeltaVarintV1 => {
+                if bytes.len() < 8 {
+                    bail!("posting_list(delta-varint) chunk too small");
+                }
+                let count = LittleEndian::read_u32(&bytes[0..4]) as usize;
+                let dim = self.footer.dim as usize;
+                let mut cur = LittleEndian::read_u32(&bytes[4..8]);
+                let mut offset = 8usize;
+                let mut row_ids = Vec::<u32>::with_capacity(count);
+                if count > 0 {
+                    row_ids.push(cur);
+                    for _ in 1..count {
+                        let (delta, used) = decode_uleb128_u32(&bytes[offset..])?;
+                        offset += used;
+                        cur = cur.wrapping_add(delta);
+                        row_ids.push(cur);
+                    }
+                }
+                let vectors_bytes = count * dim * 4;
+                if bytes.len() != offset + vectors_bytes {
+                    bail!(
+                        "posting_list(delta-varint) size mismatch: expected {} bytes, got {}",
+                        offset + vectors_bytes,
+                        bytes.len()
+                    );
+                }
+                let mut vectors = vec![0f32; count * dim];
+                LittleEndian::read_f32_into(&bytes[offset..], &mut vectors);
+                Ok((row_ids, vectors))
+            }
         }
-        let mut row_ids = vec![0u32; count];
-        LittleEndian::read_u32_into(&bytes[4..row_ids_bytes], &mut row_ids);
-        let mut vectors = vec![0f32; count * dim];
-        LittleEndian::read_f32_into(&bytes[row_ids_bytes..], &mut vectors);
-        Ok((row_ids, vectors))
+    }
+}
+
+fn decode_uleb128_u32(mut input: &[u8]) -> Result<(u32, usize)> {
+    let mut value: u32 = 0;
+    let mut shift: u32 = 0;
+    let mut used = 0usize;
+    loop {
+        let Some(&b) = input.first() else {
+            bail!("uleb128 truncated");
+        };
+        input = &input[1..];
+        used += 1;
+        let low = (b & 0x7f) as u32;
+        if shift >= 32 && low != 0 {
+            bail!("uleb128 overflow");
+        }
+        value |= low.wrapping_shl(shift);
+        if (b & 0x80) == 0 {
+            return Ok((value, used));
+        }
+        shift = shift.saturating_add(7);
+        if used > 5 {
+            bail!("uleb128 too long for u32");
+        }
+    }
+}
+
+fn encode_uleb128_u32(mut v: u32, out: &mut Vec<u8>) {
+    while v >= 0x80 {
+        out.push(((v as u8) & 0x7f) | 0x80);
+        v >>= 7;
+    }
+    out.push(v as u8);
+}
+
+#[derive(Debug, Clone)]
+pub struct IvfFlatArtifactBuildOptions {
+    pub posting_codec: PostingCodec,
+}
+
+impl Default for IvfFlatArtifactBuildOptions {
+    fn default() -> Self {
+        Self {
+            posting_codec: PostingCodec::Raw,
+        }
     }
 }
 
@@ -233,6 +317,24 @@ pub fn build_ivf_flat_artifact(
     dim: usize,
     index_name: &str,
     build_options: IvfFlatBuildOptions,
+) -> Result<PathBuf> {
+    build_ivf_flat_artifact_with_options(
+        base_f3_path,
+        vector_leaf_index,
+        dim,
+        index_name,
+        build_options,
+        IvfFlatArtifactBuildOptions::default(),
+    )
+}
+
+pub fn build_ivf_flat_artifact_with_options(
+    base_f3_path: impl AsRef<Path>,
+    vector_leaf_index: usize,
+    dim: usize,
+    index_name: &str,
+    build_options: IvfFlatBuildOptions,
+    artifact_options: IvfFlatArtifactBuildOptions,
 ) -> Result<PathBuf> {
     let base_f3_path = base_f3_path.as_ref();
     let index_dir = PathBuf::from(format!("{}.vindex", base_f3_path.display()));
@@ -324,6 +426,7 @@ pub fn build_ivf_flat_artifact(
         dim,
         index_name,
         &build_options,
+        &artifact_options,
         &index,
     )?;
 
@@ -346,6 +449,7 @@ pub fn build_ivf_flat_artifact(
         metric: "l2".to_string(),
         build_params: serde_json::json!({
             "format": "artifact_v1",
+            "posting_codec": serde_json::to_value(artifact_options.posting_codec).unwrap_or(serde_json::Value::Null),
             "nlist": build_options.nlist,
             "train_sample": build_options.train_sample,
             "seed": build_options.seed,
@@ -365,6 +469,7 @@ fn write_ivf_flat_artifact_file(
     dim: usize,
     index_name: &str,
     build_options: &IvfFlatBuildOptions,
+    artifact_options: &IvfFlatArtifactBuildOptions,
     index: &IvfFlatIndex,
 ) -> Result<()> {
     let f = File::create(index_path)
@@ -389,7 +494,7 @@ fn write_ivf_flat_artifact_file(
         offset,
         len: buf.len() as u64,
         raw_len: buf.len() as u64,
-        codec: "raw".to_string(),
+        codec: PostingCodec::Raw,
     });
 
     // list_offsets chunk (raw u64[])
@@ -403,38 +508,64 @@ fn write_ivf_flat_artifact_file(
         offset,
         len: buf.len() as u64,
         raw_len: buf.len() as u64,
-        codec: "raw".to_string(),
+        codec: PostingCodec::Raw,
     });
 
-    // posting_list chunks: [count:u32][row_ids:u32*count][vectors:f32*(count*dim)]
+    // posting_list chunks: codec-specific layout, see `PostingCodec`.
     for list_id in 0..index.nlist {
         let start = index.list_offsets[list_id] as usize;
         let end = index.list_offsets[list_id + 1] as usize;
         let count = end.saturating_sub(start);
         let offset = w.stream_position()?;
 
-        let mut header = [0u8; 4];
-        LittleEndian::write_u32(&mut header, count as u32);
-        w.write_all(&header)?;
-
-        let row_ids_slice = &index.row_ids[start..end];
-        let mut row_ids_buf = vec![0u8; count * 4];
-        LittleEndian::write_u32_into(row_ids_slice, &mut row_ids_buf);
-        w.write_all(&row_ids_buf)?;
-
         let vectors_slice = &index.vectors[start * dim..end * dim];
         let mut vectors_buf = vec![0u8; count * dim * 4];
         LittleEndian::write_f32_into(vectors_slice, &mut vectors_buf);
-        w.write_all(&vectors_buf)?;
 
-        let len = (4 + row_ids_buf.len() + vectors_buf.len()) as u64;
+        let mut encoded = Vec::<u8>::new();
+        let raw_len: u64;
+        match artifact_options.posting_codec {
+            PostingCodec::Raw => {
+                encoded.reserve(4 + count * 4 + vectors_buf.len());
+                let mut header = [0u8; 4];
+                LittleEndian::write_u32(&mut header, count as u32);
+                encoded.extend_from_slice(&header);
+                let row_ids_slice = &index.row_ids[start..end];
+                let mut row_ids_buf = vec![0u8; count * 4];
+                LittleEndian::write_u32_into(row_ids_slice, &mut row_ids_buf);
+                encoded.extend_from_slice(&row_ids_buf);
+                encoded.extend_from_slice(&vectors_buf);
+                raw_len = encoded.len() as u64;
+            }
+            PostingCodec::RowIdDeltaVarintV1 => {
+                encoded.reserve(8 + count * 2 + vectors_buf.len());
+                let mut header = [0u8; 4];
+                LittleEndian::write_u32(&mut header, count as u32);
+                encoded.extend_from_slice(&header);
+                let row_ids_slice = &index.row_ids[start..end];
+                let first = row_ids_slice.first().copied().unwrap_or(0);
+                let mut first_buf = [0u8; 4];
+                LittleEndian::write_u32(&mut first_buf, first);
+                encoded.extend_from_slice(&first_buf);
+                for wpair in row_ids_slice.windows(2) {
+                    let delta = wpair[1].wrapping_sub(wpair[0]);
+                    encode_uleb128_u32(delta, &mut encoded);
+                }
+                let row_ids_raw_len = 4 + count * 4;
+                raw_len = (row_ids_raw_len + vectors_buf.len()) as u64;
+                encoded.extend_from_slice(&vectors_buf);
+            }
+        }
+        w.write_all(&encoded)?;
+
+        let len = encoded.len() as u64;
         chunks.push(ChunkDesc {
             chunk_type: ChunkType::PostingList,
             list_id: Some(list_id as u32),
             offset,
             len,
-            raw_len: len,
-            codec: "raw".to_string(),
+            raw_len,
+            codec: artifact_options.posting_codec,
         });
     }
 
@@ -449,6 +580,7 @@ fn write_ivf_flat_artifact_file(
         metric: "l2".to_string(),
         build_params: serde_json::json!({
             "format": "artifact_v1",
+            "posting_codec": serde_json::to_value(artifact_options.posting_codec).unwrap_or(serde_json::Value::Null),
             "nlist": build_options.nlist,
             "train_sample": build_options.train_sample,
             "seed": build_options.seed,

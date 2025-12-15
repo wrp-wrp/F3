@@ -4,7 +4,8 @@ use arrow_array::FixedSizeListArray;
 use clap::Parser;
 use fff_poc::reader::{FileReaderV2Builder, Projection, Selection};
 use fff_vindex::artifact::ivf_flat::{
-    build_ivf_flat_artifact, load_ivf_flat_artifact, search_ivf_flat_artifact_native,
+    build_ivf_flat_artifact_with_options, load_ivf_flat_artifact, search_ivf_flat_artifact_native,
+    IvfFlatArtifactBuildOptions, PostingCodec,
 };
 use fff_vindex::artifact::wasm_ivf_flat::WasmIvfFlatKernel;
 use fff_vindex::ivf_flat::{
@@ -55,6 +56,10 @@ struct Args {
     /// Run IVF search via a Wasm kernel (path to the `.wasm` module). Implies `--artifact`.
     #[arg(long)]
     artifact_wasm_kernel: Option<PathBuf>,
+
+    /// Posting codec for artifact: `raw` or `row_id_delta_varint_v1`.
+    #[arg(long, default_value = "raw")]
+    artifact_posting_codec: String,
 }
 
 fn main() -> Result<()> {
@@ -70,27 +75,45 @@ fn main() -> Result<()> {
     };
 
     let (index_path, results) = if let Some(wasm_path) = &args.artifact_wasm_kernel {
-        let index_path = build_ivf_flat_artifact(
+        let posting_codec = match args.artifact_posting_codec.as_str() {
+            "raw" => PostingCodec::Raw,
+            "row_id_delta_varint_v1" => PostingCodec::RowIdDeltaVarintV1,
+            other => return Err(anyhow!("unsupported --artifact-posting-codec: {other}")),
+        };
+        let index_path = build_ivf_flat_artifact_with_options(
             &args.base_f3,
             args.vector_leaf_index,
             args.dim,
             &args.index_name,
             build_opts,
+            IvfFlatArtifactBuildOptions { posting_codec },
         )
         .with_context(|| "build ivf-flat artifact")?;
         let artifact = load_ivf_flat_artifact(&index_path)?;
         let artifact = Arc::new(artifact);
         let mut kernel = WasmIvfFlatKernel::load(wasm_path, Arc::clone(&artifact))
             .with_context(|| "load wasm ivf-flat kernel")?;
+        kernel.reset_stats();
         let results = kernel.search(&artifact, &query, args.k, args.nprobe)?;
+        let stats = kernel.stats();
+        println!(
+            "wasm stats: chunks_fetched={} compressed_bytes_in={} raw_bytes_decoded={}",
+            stats.chunks_fetched, stats.compressed_bytes_in, stats.raw_bytes_decoded
+        );
         (index_path, results)
     } else if args.artifact {
-        let index_path = build_ivf_flat_artifact(
+        let posting_codec = match args.artifact_posting_codec.as_str() {
+            "raw" => PostingCodec::Raw,
+            "row_id_delta_varint_v1" => PostingCodec::RowIdDeltaVarintV1,
+            other => return Err(anyhow!("unsupported --artifact-posting-codec: {other}")),
+        };
+        let index_path = build_ivf_flat_artifact_with_options(
             &args.base_f3,
             args.vector_leaf_index,
             args.dim,
             &args.index_name,
             build_opts,
+            IvfFlatArtifactBuildOptions { posting_codec },
         )
         .with_context(|| "build ivf-flat artifact")?;
         let artifact = load_ivf_flat_artifact(&index_path)?;

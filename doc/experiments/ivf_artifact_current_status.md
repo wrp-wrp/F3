@@ -109,14 +109,14 @@ Wasm 的每次迭代 JSON 行现在包含这些字段（来自 `vector_ivf_flat_
 
 > 注意：stage profiling 会把距离计算与 heap 更新拆成多 pass，会额外引入开销；它的用途是“时间归因”，不是“峰值性能”。
 
-#### Stage profiling 结果（SIFT100K，nq=32，warm，p50）
+#### Stage profiling 结果（SIFT100K，nq=32，warm，p50 over iterations）
 
 | case | codec | index_bytes | p50_wall_ms | fetch_ms | transfer_ms | centroid_ms | decode_ms | dist_ms | heap_ms |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| native_f32_warm | raw | 51,640,895 | 28.518 | - | - | 0.069 | 0.000 | 27.880 | 0.678 |
-| wasm_f32_warm | raw | 51,640,895 | 58.597 | 0.000 | 6.963 | 0.113 | 0.000 | 49.992 | 1.297 |
-| native_f16_warm | raw_f16 | 26,041,127 | 28.361 | - | - | 0.068 | 0.000 | 27.606 | 0.663 |
-| wasm_f16_warm | raw_f16 | 26,041,127 | 50.467 | 0.000 | 0.001 | 0.114 | 0.000 | 48.970 | 1.316 |
+| native_f32_warm | raw | 51,640,895 | 28.518 | - | - | 0.069 | 0.000 | 27.723 | 0.679 |
+| wasm_f32_warm | raw | 51,640,895 | 58.597 | 0.000 | 6.963 | 0.113 | 0.000 | 49.865 | 1.297 |
+| native_f16_warm | raw_f16 | 26,041,127 | 28.361 | - | - | 0.067 | 0.000 | 27.581 | 0.668 |
+| wasm_f16_warm | raw_f16 | 26,041,127 | 50.467 | 0.000 | 0.001 | 0.114 | 0.000 | 48.906 | 1.303 |
 
 ### SIMD 公平性（论文里应该怎么做）
 
@@ -147,18 +147,18 @@ Wasm 的每次迭代 JSON 行现在包含这些字段（来自 `vector_ivf_flat_
 - `native_f16_warm ≈ 28.177ms`，`native_f16_cold ≈ 102.289ms`
 - `wasm_f16_warm ≈ 50.215ms`，`wasm_f16_cold ≈ 158.466ms`
 
-#### 严格对齐实验结果（SIFT100K，nq=32，p50）
+#### 严格对齐实验结果（SIFT100K，nq=32，p50 over iterations）
 
 | case | codec | cache | index_bytes | p50_wall_ms | fetch_ms | transfer_ms | decode_ms | compute_ms | chunks_fetched |
 |---|---|---|---:|---:|---:|---:|---:|---:|---:|
 | native_f32_warm | raw | posting_cache=on | 51,640,895 | 27.616 | - | - | - | - | - |
 | native_f32_cold | raw | posting_cache=off | 51,640,895 | 59.186 | - | - | - | - | - |
-| wasm_f32_warm | raw | host_cache=on | 51,640,895 | 57.634 | 0.000 | 7.397 | 0.000 | 49.818 | 0 |
-| wasm_f32_cold | raw | host_cache=off | 51,640,895 | 89.745 | 26.159 | 40.603 | 0.000 | 49.016 | 513 |
+| wasm_f32_warm | raw | host_cache=on | 51,640,895 | 57.634 | 0.000 | 7.460 | 0.000 | 49.737 | 0 |
+| wasm_f32_cold | raw | host_cache=off | 51,640,895 | 89.745 | 25.665 | 40.039 | 0.000 | 49.016 | 513 |
 | native_f16_warm | raw_f16 | posting_cache=on | 26,041,127 | 28.177 | - | - | - | - | - |
 | native_f16_cold | raw_f16 | posting_cache=off | 26,041,127 | 102.289 | - | - | - | - | - |
-| wasm_f16_warm | raw_f16 | host_cache=on + kernel_decoded_cache=on | 26,041,127 | 50.215 | 0.000 | 0.001 | 0.000 | 50.941 | 0 |
-| wasm_f16_cold | raw_f16 | host_cache=off + kernel_decoded_cache=off | 26,041,127 | 158.466 | 10.804 | 17.655 | 91.461 | 49.195 | 513 |
+| wasm_f16_warm | raw_f16 | host_cache=on + kernel_decoded_cache=on | 26,041,127 | 50.215 | 0.000 | 0.001 | 0.000 | 50.046 | 0 |
+| wasm_f16_cold | raw_f16 | host_cache=off + kernel_decoded_cache=off | 26,041,127 | 158.466 | 10.784 | 17.629 | 90.911 | 49.116 | 513 |
 
 
 ### Size 拆分（同一份 index 文件）

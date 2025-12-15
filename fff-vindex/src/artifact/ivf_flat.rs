@@ -115,6 +115,26 @@ impl IvfFlatArtifact {
         Ok(())
     }
 
+    pub fn validate_base_checksums(&self) -> Result<()> {
+        let (schema_checksum, data_checksum) = read_base_checksums(&self.footer.base.path)
+            .with_context(|| "read base file checksums (schema/data)")?;
+        if schema_checksum != self.footer.base.schema_checksum {
+            bail!(
+                "base schema checksum mismatch: expected {}, got {}",
+                self.footer.base.schema_checksum,
+                schema_checksum
+            );
+        }
+        if data_checksum != self.footer.base.data_checksum {
+            bail!(
+                "base data checksum mismatch: expected {}, got {}",
+                self.footer.base.data_checksum,
+                data_checksum
+            );
+        }
+        Ok(())
+    }
+
     fn find_chunk(&self, chunk_type: ChunkType, list_id: Option<u32>) -> Result<&ChunkDesc> {
         self.footer
             .chunks

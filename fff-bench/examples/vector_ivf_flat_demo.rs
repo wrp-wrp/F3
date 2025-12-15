@@ -11,9 +11,11 @@ use fff_vindex::artifact::wasm_ivf_flat::WasmIvfFlatKernel;
 use fff_vindex::ivf_flat::{
     build_ivf_flat_sidecar, load_ivf_flat_index, search_ivf_flat, IvfFlatBuildOptions,
 };
+use serde_json::json;
 use std::fs::File;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -68,6 +70,22 @@ struct Args {
     /// Disable host-side chunk cache for wasm kernel (forces reads each time).
     #[arg(long, default_value_t = false)]
     artifact_wasm_no_cache: bool,
+
+    /// Warmup iterations (builds index once, runs search multiple times).
+    #[arg(long, default_value_t = 1)]
+    warmup: usize,
+
+    /// Repeated iterations to measure.
+    #[arg(long, default_value_t = 5)]
+    repeat: usize,
+
+    /// Print per-iteration stats as JSON lines.
+    #[arg(long, default_value_t = false)]
+    json: bool,
+
+    /// Do not print the top-k results (only print stats).
+    #[arg(long, default_value_t = false)]
+    quiet: bool,
 }
 
 fn main() -> Result<()> {
@@ -102,31 +120,72 @@ fn main() -> Result<()> {
         let mut kernel = WasmIvfFlatKernel::load(wasm_path, Arc::clone(&artifact))
             .with_context(|| "load wasm ivf-flat kernel")?;
         kernel.set_cache_enabled(!args.artifact_wasm_no_cache);
-        kernel.reset_stats();
-        let results_batch = if args.nq == 1 {
-            vec![kernel.search(&artifact, &queries, args.k, args.nprobe)?]
-        } else {
-            kernel.search_batch(&artifact, &queries, args.nq, args.k, args.nprobe)?
-        };
-        let stats = kernel.stats();
-        println!(
-            "wasm stats: cache_hits={} chunks_fetched={} compressed_bytes_in={} raw_bytes_decoded={} fetch_time_ms={:.3} total_time_ms={:.3}",
-            stats.cache_hits,
-            stats.chunks_fetched,
-            stats.compressed_bytes_in,
-            stats.raw_bytes_decoded,
-            (stats.fetch_time_ns as f64) / 1e6,
-            (stats.total_time_ns as f64) / 1e6,
-        );
-        println!(
-            "wasm chunks(sample): {:?}",
-            stats.fetched_chunk_ids_sample
-        );
-        println!(
-            "wasm chunks(miss sample): {:?}",
-            stats.cache_miss_chunk_ids_sample
-        );
-        (index_path, results_batch.into_iter().next().unwrap_or_default())
+        let nq = args.nq;
+
+        // Warmup
+        for _ in 0..args.warmup {
+            kernel.reset_stats();
+            let _ = if nq == 1 {
+                kernel.search(&artifact, &queries, args.k, args.nprobe)?
+            } else {
+                kernel.search_batch(&artifact, &queries, nq, args.k, args.nprobe)?
+                    .into_iter()
+                    .next()
+                    .unwrap_or_default()
+            };
+        }
+
+        // Measure
+        let mut last_results = Vec::new();
+        for it in 0..args.repeat {
+            kernel.reset_stats();
+            let run_start = Instant::now();
+            let results_batch = if nq == 1 {
+                vec![kernel.search(&artifact, &queries, args.k, args.nprobe)?]
+            } else {
+                kernel.search_batch(&artifact, &queries, nq, args.k, args.nprobe)?
+            };
+            let wall_ms = run_start.elapsed().as_secs_f64() * 1000.0;
+            let stats = kernel.stats();
+            if args.json {
+                println!(
+                    "{}",
+                    json!({
+                        "engine": "wasm",
+                        "iteration": it,
+                        "nq": nq,
+                        "k": args.k,
+                        "nprobe": args.nprobe,
+                        "posting_codec": args.artifact_posting_codec,
+                        "cache_enabled": !args.artifact_wasm_no_cache,
+                        "wall_ms": wall_ms,
+                        "kernel_total_ms": (stats.total_time_ns as f64) / 1e6,
+                        "fetch_ms": (stats.fetch_time_ns as f64) / 1e6,
+                        "cache_hits": stats.cache_hits,
+                        "chunks_fetched": stats.chunks_fetched,
+                        "compressed_bytes_in": stats.compressed_bytes_in,
+                        "raw_bytes_decoded": stats.raw_bytes_decoded,
+                        "chunks_sample": stats.fetched_chunk_ids_sample,
+                        "chunks_miss_sample": stats.cache_miss_chunk_ids_sample,
+                    })
+                );
+            } else {
+                println!(
+                    "wasm it={} wall_ms={:.3} kernel_ms={:.3} fetch_ms={:.3} cache_hits={} fetched={} in={} raw={}",
+                    it,
+                    wall_ms,
+                    (stats.total_time_ns as f64) / 1e6,
+                    (stats.fetch_time_ns as f64) / 1e6,
+                    stats.cache_hits,
+                    stats.chunks_fetched,
+                    stats.compressed_bytes_in,
+                    stats.raw_bytes_decoded,
+                );
+            }
+            last_results = results_batch.into_iter().next().unwrap_or_default();
+        }
+
+        (index_path, last_results)
     } else if args.artifact {
         let posting_codec = match args.artifact_posting_codec.as_str() {
             "raw" => PostingCodec::Raw,
@@ -143,12 +202,38 @@ fn main() -> Result<()> {
         )
         .with_context(|| "build ivf-flat artifact")?;
         let artifact = load_ivf_flat_artifact(&index_path)?;
-        let mut all = Vec::new();
-        for q in 0..args.nq {
-            let query = &queries[q * args.dim..(q + 1) * args.dim];
-            all.push(search_ivf_flat_artifact_native(&artifact, query, args.k, args.nprobe)?);
+        for _ in 0..args.warmup {
+            for q in 0..args.nq {
+                let query = &queries[q * args.dim..(q + 1) * args.dim];
+                let _ = search_ivf_flat_artifact_native(&artifact, query, args.k, args.nprobe)?;
+            }
         }
-        (index_path, all.into_iter().next().unwrap_or_default())
+        let mut last = Vec::new();
+        for it in 0..args.repeat {
+            let run_start = Instant::now();
+            for q in 0..args.nq {
+                let query = &queries[q * args.dim..(q + 1) * args.dim];
+                last = search_ivf_flat_artifact_native(&artifact, query, args.k, args.nprobe)?;
+            }
+            let wall_ms = run_start.elapsed().as_secs_f64() * 1000.0;
+            if args.json {
+                println!(
+                    "{}",
+                    json!({
+                        "engine": "native_artifact",
+                        "iteration": it,
+                        "nq": args.nq,
+                        "k": args.k,
+                        "nprobe": args.nprobe,
+                        "posting_codec": args.artifact_posting_codec,
+                        "wall_ms": wall_ms,
+                    })
+                );
+            } else {
+                println!("native_artifact it={} wall_ms={:.3}", it, wall_ms);
+            }
+        }
+        (index_path, last)
     } else {
         let index_path = build_ivf_flat_sidecar(
             &args.base_f3,
@@ -159,18 +244,45 @@ fn main() -> Result<()> {
         )
         .with_context(|| "build ivf-flat index")?;
         let index = load_ivf_flat_index(&index_path)?;
-        let mut all = Vec::new();
-        for q in 0..args.nq {
-            let query = &queries[q * args.dim..(q + 1) * args.dim];
-            all.push(search_ivf_flat(&index, query, args.k, args.nprobe)?);
+        for _ in 0..args.warmup {
+            for q in 0..args.nq {
+                let query = &queries[q * args.dim..(q + 1) * args.dim];
+                let _ = search_ivf_flat(&index, query, args.k, args.nprobe)?;
+            }
         }
-        (index_path, all.into_iter().next().unwrap_or_default())
+        let mut last = Vec::new();
+        for it in 0..args.repeat {
+            let run_start = Instant::now();
+            for q in 0..args.nq {
+                let query = &queries[q * args.dim..(q + 1) * args.dim];
+                last = search_ivf_flat(&index, query, args.k, args.nprobe)?;
+            }
+            let wall_ms = run_start.elapsed().as_secs_f64() * 1000.0;
+            if args.json {
+                println!(
+                    "{}",
+                    json!({
+                        "engine": "native_sidecar",
+                        "iteration": it,
+                        "nq": args.nq,
+                        "k": args.k,
+                        "nprobe": args.nprobe,
+                        "wall_ms": wall_ms,
+                    })
+                );
+            } else {
+                println!("native_sidecar it={} wall_ms={:.3}", it, wall_ms);
+            }
+        }
+        (index_path, last)
     };
 
-    println!("index: {}", index_path.display());
-    println!("top{} (nprobe={}):", results.len(), args.nprobe);
-    for r in results {
-        println!("row_id={} dist={}", r.row_id, r.distance);
+    if !args.quiet {
+        println!("index: {}", index_path.display());
+        println!("top{} (nprobe={}):", results.len(), args.nprobe);
+        for r in results {
+            println!("row_id={} dist={}", r.row_id, r.distance);
+        }
     }
     Ok(())
 }

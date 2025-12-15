@@ -249,7 +249,7 @@ pub fn search_ivf_flat(
     Ok(out)
 }
 
-fn l2_sq(a: &[f32], b: &[f32]) -> f32 {
+pub(crate) fn l2_sq(a: &[f32], b: &[f32]) -> f32 {
     a.iter()
         .zip(b.iter())
         .map(|(x, y)| {
@@ -482,7 +482,7 @@ fn load_ivf_flat_index_f3(index_path: &Path) -> Result<IvfFlatIndex> {
     })
 }
 
-fn kmeans_l2(
+pub(crate) fn kmeans_l2(
     samples: &[f32],
     dim: usize,
     k: usize,
@@ -551,7 +551,7 @@ fn kmeans_l2(
     Ok(centroids)
 }
 
-fn assign_ivf_flat(
+pub(crate) fn assign_ivf_flat(
     centroids: &[f32],
     dim: usize,
     nlist: usize,
@@ -690,7 +690,7 @@ fn write_ivf_flat_index_file(
     Ok(())
 }
 
-fn read_base_checksums(base_f3_path: &Path) -> Result<(u64, u64)> {
+pub(crate) fn read_base_checksums(base_f3_path: &Path) -> Result<(u64, u64)> {
     use fff_poc::io::reader::Reader as _;
     use fff_format::{MAGIC, POSTSCRIPT_SIZE};
 
@@ -709,7 +709,7 @@ fn read_base_checksums(base_f3_path: &Path) -> Result<(u64, u64)> {
     Ok((schema_checksum, data_checksum))
 }
 
-fn scan_vectors_from_f3(
+pub(crate) fn scan_vectors_from_f3(
     base_f3_path: &Path,
     vector_leaf_index: usize,
     dim: usize,

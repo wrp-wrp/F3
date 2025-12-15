@@ -3,7 +3,12 @@ use arrow_array::cast::AsArray;
 use arrow_array::FixedSizeListArray;
 use clap::Parser;
 use fff_poc::reader::{FileReaderV2Builder, Projection, Selection};
-use fff_vindex::ivf_flat::{build_ivf_flat_sidecar, load_ivf_flat_index, search_ivf_flat, IvfFlatBuildOptions};
+use fff_vindex::artifact::ivf_flat::{
+    build_ivf_flat_artifact, load_ivf_flat_artifact, search_ivf_flat_artifact_native,
+};
+use fff_vindex::ivf_flat::{
+    build_ivf_flat_sidecar, load_ivf_flat_index, search_ivf_flat, IvfFlatBuildOptions,
+};
 use std::fs::File;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -41,28 +46,49 @@ struct Args {
 
     #[arg(long, default_value_t = 8)]
     nprobe: usize,
+
+    /// Build and query the IVF artifact container instead of the legacy ivf_flat file.
+    #[arg(long, default_value_t = false)]
+    artifact: bool,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    let index_path = build_ivf_flat_sidecar(
-        &args.base_f3,
-        args.vector_leaf_index,
-        args.dim,
-        &args.index_name,
-        IvfFlatBuildOptions {
-            nlist: args.nlist,
-            train_sample: args.train_sample,
-            seed: args.seed,
-            max_kmeans_iters: args.max_kmeans_iters,
-        },
-    )
-    .with_context(|| "build ivf-flat index")?;
-
     let query = read_first_vector(&args.base_f3, args.vector_leaf_index, args.dim)?;
-    let index = load_ivf_flat_index(&index_path)?;
-    let results = search_ivf_flat(&index, &query, args.k, args.nprobe)?;
+
+    let build_opts = IvfFlatBuildOptions {
+        nlist: args.nlist,
+        train_sample: args.train_sample,
+        seed: args.seed,
+        max_kmeans_iters: args.max_kmeans_iters,
+    };
+
+    let (index_path, results) = if args.artifact {
+        let index_path = build_ivf_flat_artifact(
+            &args.base_f3,
+            args.vector_leaf_index,
+            args.dim,
+            &args.index_name,
+            build_opts,
+        )
+        .with_context(|| "build ivf-flat artifact")?;
+        let artifact = load_ivf_flat_artifact(&index_path)?;
+        let results = search_ivf_flat_artifact_native(&artifact, &query, args.k, args.nprobe)?;
+        (index_path, results)
+    } else {
+        let index_path = build_ivf_flat_sidecar(
+            &args.base_f3,
+            args.vector_leaf_index,
+            args.dim,
+            &args.index_name,
+            build_opts,
+        )
+        .with_context(|| "build ivf-flat index")?;
+        let index = load_ivf_flat_index(&index_path)?;
+        let results = search_ivf_flat(&index, &query, args.k, args.nprobe)?;
+        (index_path, results)
+    };
 
     println!("index: {}", index_path.display());
     println!("top{} (nprobe={}):", results.len(), args.nprobe);

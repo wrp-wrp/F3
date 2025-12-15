@@ -122,11 +122,15 @@ Wasm 的每次迭代 JSON 行现在包含这些字段（来自 `vector_ivf_flat_
 
 你说得对：为了公平，SIMD 必须作为一个明确的实验维度，而不是“某边默认开、某边默认关”。
 
-建议论文报告两组设置（两边对齐）：
-- **Portable baseline（默认）**：native 不启用 `-C target-cpu=native`，Wasm 不使用 `simd128` 指令（保证可移植、对比更干净）。
-- **Optimized（对齐 SIMD）**：native 使用 `-C target-cpu=native`（或显式 AVX/NEON），Wasm 版本编译出 `simd128`（并确认 Wasmtime 支持 simd）。
+建议论文报告两组设置（两边对齐），并把构建 flags 写进结果目录（可复现）：
+- **Portable baseline（公平）**：native/wasm 都使用默认编译配置（不要求 wasm `simd128`），强调可移植与“默认体验”。
+- **SIMD baseline（公平）**：native 使用 `-C target-cpu=native`，Wasm 使用 `-C target-feature=+simd128`（并确认 Wasmtime 支持 simd）。
 
 两组都报 `Recall@k` + `p50/p99 latency`，并在图注明确说明编译/运行配置（否则审稿人会认为不公平）。
+
+对应脚本（会把 `RUSTFLAGS` 写入 `results/.../build_config.txt`）：
+- 严格对齐（cold/warm）：`bash scripts/run_sift_ivf_aligned_fair.sh portable` / `bash scripts/run_sift_ivf_aligned_fair.sh simd`
+- Stage profiling（warm）：`bash scripts/run_sift_ivf_aligned_profile_fair.sh portable` / `bash scripts/run_sift_ivf_aligned_profile_fair.sh simd`
 
 ## 严格对齐实验（native vs wasm，cold/warm）
 

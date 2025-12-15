@@ -1,4 +1,5 @@
 /target
+target_fair_*/
 .vscode
 *.log
 __pycache__
@@ -8,6 +9,7 @@ data_*
 data/sift/
 results/sift_ivf_artifact_*/
 results/sift_ivf_aligned_*/
+results/sift_ivf_aligned_profile_*/
 
 # for storing aws credentials
 .env 

@@ -123,7 +123,7 @@ pub struct WasmIvfFlatKernel {
     memory: Memory,
     alloc: TypedFunc<(u32, u32), u32>,
     dealloc: TypedFunc<(u32, u32, u32), ()>,
-    search: TypedFunc<(u32, u32, u32, u32, u32, u32, u32, u32), u32>,
+    search_batch: TypedFunc<(u32, u32, u32, u32, u32, u32, u32, u32, u32, u32), u32>,
 }
 
 impl WasmIvfFlatKernel {
@@ -183,19 +183,19 @@ impl WasmIvfFlatKernel {
         let dealloc = instance
             .get_typed_func::<(u32, u32, u32), ()>(&mut store, "dealloc_ffi")
             .with_context(|| "get export dealloc_ffi")?;
-        let search = instance
-            .get_typed_func::<(u32, u32, u32, u32, u32, u32, u32, u32), u32>(
+        let search_batch = instance
+            .get_typed_func::<(u32, u32, u32, u32, u32, u32, u32, u32, u32, u32), u32>(
                 &mut store,
-                "ivf_flat_search_ffi",
+                "ivf_flat_search_batch_ffi",
             )
-            .with_context(|| "get export ivf_flat_search_ffi")?;
+            .with_context(|| "get export ivf_flat_search_batch_ffi")?;
 
         Ok(Self {
             store,
             memory,
             alloc,
             dealloc,
-            search,
+            search_batch,
         })
     }
 
@@ -221,16 +221,34 @@ impl WasmIvfFlatKernel {
         k: usize,
         nprobe: usize,
     ) -> Result<Vec<SearchResult>> {
+        let batches = self.search_batch(artifact, query, 1, k, nprobe)?;
+        Ok(batches.into_iter().next().unwrap_or_default())
+    }
+
+    pub fn search_batch(
+        &mut self,
+        artifact: &IvfFlatArtifact,
+        queries: &[f32],
+        nq: usize,
+        k: usize,
+        nprobe: usize,
+    ) -> Result<Vec<Vec<SearchResult>>> {
         let dim = artifact.footer().dim as usize;
         let nlist = artifact.footer().nlist as usize;
-        if query.len() != dim {
-            bail!("query dim mismatch: expected {dim}, got {}", query.len());
-        }
-        if k == 0 {
+        if nq == 0 {
             return Ok(vec![]);
         }
+        if queries.len() != nq * dim {
+            bail!(
+                "queries len mismatch: expected {}, got {}",
+                nq * dim,
+                queries.len()
+            );
+        }
+        if k == 0 {
+            return Ok(vec![vec![]; nq]);
+        }
 
-        // Build directory buffer for wasm.
         let centroids_id = artifact.find_chunk_id(ChunkType::Centroids, None)?;
         let posting_codec = artifact
             .footer()
@@ -243,6 +261,7 @@ impl WasmIvfFlatKernel {
             PostingCodec::Raw => 0,
             PostingCodec::RowIdDeltaVarintV1 => 1,
         };
+
         let mut posting_ids = vec![0u32; nlist];
         for list_id in 0..nlist {
             posting_ids[list_id] =
@@ -257,81 +276,114 @@ impl WasmIvfFlatKernel {
             dir.extend_from_slice(&id.to_le_bytes());
         }
 
-        let query_bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(query.as_ptr() as *const u8, query.len() * 4)
+        let queries_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(queries.as_ptr() as *const u8, queries.len() * 4)
         };
 
         let out_cap = k as u32;
-        let out_len_bytes = (out_cap as usize) * 8;
+        let out_len_bytes = (nq as u32) * out_cap * 8;
+        let counts_len_bytes = (nq as u32) * 4;
 
-        // Allocate and write buffers into wasm memory.
         let dir_ptr = self.alloc.call(&mut self.store, (dir.len() as u32, 8))?;
         if dir_ptr == 0 {
             bail!("wasm alloc failed for dir");
         }
         self.memory.write(&mut self.store, dir_ptr as usize, &dir)?;
 
-        let query_ptr = self
+        let queries_ptr = self
             .alloc
-            .call(&mut self.store, (query_bytes.len() as u32, 4))?;
-        if query_ptr == 0 {
+            .call(&mut self.store, (queries_bytes.len() as u32, 4))?;
+        if queries_ptr == 0 {
             self.dealloc.call(&mut self.store, (dir_ptr, dir.len() as u32, 8))?;
-            bail!("wasm alloc failed for query");
+            bail!("wasm alloc failed for queries");
         }
         self.memory
-            .write(&mut self.store, query_ptr as usize, query_bytes)?;
+            .write(&mut self.store, queries_ptr as usize, queries_bytes)?;
 
         let out_ptr = self.alloc.call(&mut self.store, (out_len_bytes as u32, 8))?;
         if out_ptr == 0 {
             self.dealloc.call(&mut self.store, (dir_ptr, dir.len() as u32, 8))?;
             self.dealloc
-                .call(&mut self.store, (query_ptr, query_bytes.len() as u32, 4))?;
+                .call(&mut self.store, (queries_ptr, queries_bytes.len() as u32, 4))?;
             bail!("wasm alloc failed for output");
+        }
+        let counts_ptr = self
+            .alloc
+            .call(&mut self.store, (counts_len_bytes as u32, 4))?;
+        if counts_ptr == 0 {
+            self.dealloc.call(&mut self.store, (dir_ptr, dir.len() as u32, 8))?;
+            self.dealloc
+                .call(&mut self.store, (queries_ptr, queries_bytes.len() as u32, 4))?;
+            self.dealloc
+                .call(&mut self.store, (out_ptr, out_len_bytes as u32, 8))?;
+            bail!("wasm alloc failed for counts");
         }
 
         let nprobe = (nprobe.min(nlist).max(1)) as u32;
         let start_total = Instant::now();
-        let out_n = self.search.call(
+        let ok = self.search_batch.call(
             &mut self.store,
             (
                 dir_ptr,
                 dir.len() as u32,
-                query_ptr,
+                queries_ptr,
+                nq as u32,
                 dim as u32,
                 k as u32,
                 nprobe,
                 out_ptr,
                 out_cap,
+                counts_ptr,
             ),
         )?;
         let total_time_ns = start_total.elapsed().as_nanos() as u64;
+        if ok == 0 {
+            bail!("wasm batch search failed");
+        }
 
-        // Read results back.
+        let counts_bytes = self
+            .memory
+            .data(&self.store)
+            .get(counts_ptr as usize..counts_ptr as usize + counts_len_bytes as usize)
+            .ok_or_else(|| anyhow::anyhow!("counts slice out of bounds"))?;
+        let mut counts = vec![0u32; nq];
+        for i in 0..nq {
+            let off = i * 4;
+            counts[i] = u32::from_le_bytes(counts_bytes[off..off + 4].try_into().unwrap());
+        }
+
         let out_bytes = self
             .memory
             .data(&self.store)
-            .get(out_ptr as usize..out_ptr as usize + (out_n as usize) * 8)
+            .get(out_ptr as usize..out_ptr as usize + out_len_bytes as usize)
             .ok_or_else(|| anyhow::anyhow!("output slice out of bounds"))?;
-        let mut results = Vec::<SearchResult>::with_capacity(out_n as usize);
-        for i in 0..out_n as usize {
-            let off = i * 8;
-            let row_id = u32::from_le_bytes(out_bytes[off..off + 4].try_into().unwrap());
-            let dist_bits = u32::from_le_bytes(out_bytes[off + 4..off + 8].try_into().unwrap());
-            results.push(SearchResult {
-                row_id,
-                distance: f32::from_bits(dist_bits),
-            });
+
+        let mut results = Vec::<Vec<SearchResult>>::with_capacity(nq);
+        for q in 0..nq {
+            let mut one = Vec::<SearchResult>::with_capacity(counts[q] as usize);
+            let base = q * (out_cap as usize) * 8;
+            for i in 0..counts[q] as usize {
+                let off = base + i * 8;
+                let row_id = u32::from_le_bytes(out_bytes[off..off + 4].try_into().unwrap());
+                let dist_bits =
+                    u32::from_le_bytes(out_bytes[off + 4..off + 8].try_into().unwrap());
+                one.push(SearchResult {
+                    row_id,
+                    distance: f32::from_bits(dist_bits),
+                });
+            }
+            results.push(one);
         }
 
-        // Free wasm allocations.
         self.dealloc
             .call(&mut self.store, (dir_ptr, dir.len() as u32, 8))?;
         self.dealloc
-            .call(&mut self.store, (query_ptr, query_bytes.len() as u32, 4))?;
+            .call(&mut self.store, (queries_ptr, queries_bytes.len() as u32, 4))?;
         self.dealloc
             .call(&mut self.store, (out_ptr, out_len_bytes as u32, 8))?;
+        self.dealloc
+            .call(&mut self.store, (counts_ptr, counts_len_bytes as u32, 4))?;
 
-        // Record total wall time of the last search.
         self.store.data_mut().stats.total_time_ns = total_time_ns;
 
         Ok(results)

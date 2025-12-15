@@ -49,6 +49,10 @@ struct Args {
     #[arg(long, default_value_t = 8)]
     nprobe: usize,
 
+    /// Number of queries; queries are read from rows `[0..nq)`.
+    #[arg(long, default_value_t = 1)]
+    nq: usize,
+
     /// Build and query the IVF artifact container instead of the legacy ivf_flat file.
     #[arg(long, default_value_t = false)]
     artifact: bool,
@@ -69,7 +73,7 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    let query = read_first_vector(&args.base_f3, args.vector_leaf_index, args.dim)?;
+    let queries = read_first_vectors(&args.base_f3, args.vector_leaf_index, args.dim, args.nq)?;
 
     let build_opts = IvfFlatBuildOptions {
         nlist: args.nlist,
@@ -99,7 +103,11 @@ fn main() -> Result<()> {
             .with_context(|| "load wasm ivf-flat kernel")?;
         kernel.set_cache_enabled(!args.artifact_wasm_no_cache);
         kernel.reset_stats();
-        let results = kernel.search(&artifact, &query, args.k, args.nprobe)?;
+        let results_batch = if args.nq == 1 {
+            vec![kernel.search(&artifact, &queries, args.k, args.nprobe)?]
+        } else {
+            kernel.search_batch(&artifact, &queries, args.nq, args.k, args.nprobe)?
+        };
         let stats = kernel.stats();
         println!(
             "wasm stats: cache_hits={} chunks_fetched={} compressed_bytes_in={} raw_bytes_decoded={} fetch_time_ms={:.3} total_time_ms={:.3}",
@@ -118,7 +126,7 @@ fn main() -> Result<()> {
             "wasm chunks(miss sample): {:?}",
             stats.cache_miss_chunk_ids_sample
         );
-        (index_path, results)
+        (index_path, results_batch.into_iter().next().unwrap_or_default())
     } else if args.artifact {
         let posting_codec = match args.artifact_posting_codec.as_str() {
             "raw" => PostingCodec::Raw,
@@ -135,8 +143,12 @@ fn main() -> Result<()> {
         )
         .with_context(|| "build ivf-flat artifact")?;
         let artifact = load_ivf_flat_artifact(&index_path)?;
-        let results = search_ivf_flat_artifact_native(&artifact, &query, args.k, args.nprobe)?;
-        (index_path, results)
+        let mut all = Vec::new();
+        for q in 0..args.nq {
+            let query = &queries[q * args.dim..(q + 1) * args.dim];
+            all.push(search_ivf_flat_artifact_native(&artifact, query, args.k, args.nprobe)?);
+        }
+        (index_path, all.into_iter().next().unwrap_or_default())
     } else {
         let index_path = build_ivf_flat_sidecar(
             &args.base_f3,
@@ -147,8 +159,12 @@ fn main() -> Result<()> {
         )
         .with_context(|| "build ivf-flat index")?;
         let index = load_ivf_flat_index(&index_path)?;
-        let results = search_ivf_flat(&index, &query, args.k, args.nprobe)?;
-        (index_path, results)
+        let mut all = Vec::new();
+        for q in 0..args.nq {
+            let query = &queries[q * args.dim..(q + 1) * args.dim];
+            all.push(search_ivf_flat(&index, query, args.k, args.nprobe)?);
+        }
+        (index_path, all.into_iter().next().unwrap_or_default())
     };
 
     println!("index: {}", index_path.display());
@@ -159,18 +175,27 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn read_first_vector(base_f3: &PathBuf, leaf: usize, dim: usize) -> Result<Vec<f32>> {
+fn read_first_vectors(base_f3: &PathBuf, leaf: usize, dim: usize, nq: usize) -> Result<Vec<f32>> {
     let file = File::open(base_f3).with_context(|| format!("open {}", base_f3.display()))?;
+    let row_indexes: Vec<u64> = (0..nq as u64).collect();
     let mut reader = FileReaderV2Builder::new(Arc::new(file))
         .with_projections(Projection::All)
-        .with_selection(Selection::RowIndexes(vec![0]))
+        .with_selection(Selection::RowIndexes(row_indexes))
         .build()
         .map_err(|e| anyhow!(e.to_string()))?;
     let batches = reader
         .read_file()
         .map_err(|e| anyhow!(e.to_string()))
         .with_context(|| "read first vector")?;
-    let batch = batches.first().ok_or_else(|| anyhow!("no batches"))?;
+    let schema = batches
+        .first()
+        .ok_or_else(|| anyhow!("no batches"))?
+        .schema();
+    let batch = if batches.len() == 1 {
+        batches[0].clone()
+    } else {
+        arrow::compute::concat_batches(&schema, &batches)?
+    };
     if leaf >= batch.num_columns() {
         return Err(anyhow!(
             "vector_leaf_index out of range: {} >= {}",
@@ -191,5 +216,14 @@ fn read_first_vector(base_f3: &PathBuf, leaf: usize, dim: usize) -> Result<Vec<f
         ));
     }
     let values = fsl.values().as_primitive::<arrow::datatypes::Float32Type>();
-    Ok(values.values()[..dim].to_vec())
+    let total = nq * dim;
+    if values.values().len() < total {
+        return Err(anyhow!(
+            "not enough values for nq={}, dim={}: have {}",
+            nq,
+            dim,
+            values.values().len()
+        ));
+    }
+    Ok(values.values()[..total].to_vec())
 }

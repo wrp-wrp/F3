@@ -4,6 +4,7 @@ use fff_vindex::ivf_flat::l2_sq;
 use serde_json::json;
 use std::path::PathBuf;
 use std::time::Instant;
+use wasi_common::sync::WasiCtxBuilder;
 use wasmtime::{Caller, Config, Engine, Linker, Module, Store};
 
 #[derive(Parser, Debug)]
@@ -103,7 +104,8 @@ fn fill_f32(out: &mut [f32], mut state: u64) {
         state = state
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
-        let bits = ((state >> 32) as u32) | 0x3f80_0000;
+        let mantissa = ((state >> 32) as u32) & 0x007f_ffff;
+        let bits = 0x3f80_0000 | mantissa; // [1.0, 2.0)
         let f = f32::from_bits(bits) - 1.0;
         *v = f;
     }
@@ -115,12 +117,11 @@ struct Timed {
 }
 
 fn measure_native(query: &[f32], vectors: &[f32], count: usize, dim: usize, iters: usize, warmup: usize) -> Timed {
-    let mut checksum = 0.0f32;
     for _ in 0..warmup {
-        checksum = native_loop(query, vectors, count, dim, iters / 10 + 1);
+        let _ = native_loop(query, vectors, count, dim, iters / 10 + 1);
     }
     let start = Instant::now();
-    checksum = native_loop(query, vectors, count, dim, iters);
+    let checksum = native_loop(query, vectors, count, dim, iters);
     let elapsed_ns = start.elapsed().as_nanos() as u64;
     Timed { elapsed_ns, checksum }
 }
@@ -139,11 +140,14 @@ fn native_loop(query: &[f32], vectors: &[f32], count: usize, dim: usize, iters: 
 }
 
 struct WasmCtx {
-    store: Store<()>,
+    store: Store<WasmState>,
     memory: wasmtime::Memory,
-    alloc: wasmtime::TypedFunc<(u32, u32), u32>,
     dealloc: wasmtime::TypedFunc<(u32, u32, u32), ()>,
     micro: wasmtime::TypedFunc<(u32, u32, u32, u32, u32, u32), u32>,
+}
+
+struct WasmState {
+    wasi: wasi_common::WasiCtx,
 }
 
 fn prepare_wasm(wasm_path: &PathBuf, query: &[f32], vectors: &[f32]) -> Result<(WasmCtx, u32, u32, u32)> {
@@ -154,16 +158,19 @@ fn prepare_wasm(wasm_path: &PathBuf, query: &[f32], vectors: &[f32]) -> Result<(
         .with_context(|| format!("load wasm module {}", wasm_path.display()))?;
 
     let mut linker = Linker::new(&engine);
-    linker.func_wrap("env", "host_chunk_len", |_caller: Caller<'_, ()>, _chunk_id: u32| -> u32 {
+    wasi_common::sync::add_to_linker(&mut linker, |s: &mut WasmState| &mut s.wasi)?;
+
+    linker.func_wrap("env", "host_chunk_len", |_caller: Caller<'_, WasmState>, _chunk_id: u32| -> u32 {
         0
     })?;
     linker.func_wrap(
         "env",
         "host_read_chunk",
-        |_caller: Caller<'_, ()>, _chunk_id: u32, _dst_ptr: u32, _dst_len: u32| -> u32 { 0 },
+        |_caller: Caller<'_, WasmState>, _chunk_id: u32, _dst_ptr: u32, _dst_len: u32| -> u32 { 0 },
     )?;
 
-    let mut store = Store::new(&engine, ());
+    let wasi = WasiCtxBuilder::new().inherit_stdio().build();
+    let mut store = Store::new(&engine, WasmState { wasi });
     let instance = linker.instantiate(&mut store, &module)?;
 
     let memory = instance
@@ -184,9 +191,9 @@ fn prepare_wasm(wasm_path: &PathBuf, query: &[f32], vectors: &[f32]) -> Result<(
 
     let query_bytes = bytemuck::cast_slice(query);
     let vectors_bytes = bytemuck::cast_slice(vectors);
-    let query_ptr = alloc.call(&mut store, query_bytes.len() as u32, 4)?;
-    let vectors_ptr = alloc.call(&mut store, vectors_bytes.len() as u32, 4)?;
-    let out_ptr = alloc.call(&mut store, 4, 4)?;
+    let query_ptr = alloc.call(&mut store, (query_bytes.len() as u32, 4))?;
+    let vectors_ptr = alloc.call(&mut store, (vectors_bytes.len() as u32, 4))?;
+    let out_ptr = alloc.call(&mut store, (4, 4))?;
     memory.write(&mut store, query_ptr as usize, query_bytes)?;
     memory.write(&mut store, vectors_ptr as usize, vectors_bytes)?;
     memory.write(&mut store, out_ptr as usize, bytemuck::bytes_of(&0.0f32))?;
@@ -195,7 +202,6 @@ fn prepare_wasm(wasm_path: &PathBuf, query: &[f32], vectors: &[f32]) -> Result<(
         WasmCtx {
             store,
             memory,
-            alloc,
             dealloc,
             micro,
         },
@@ -257,4 +263,3 @@ fn measure_wasm(
 
     Ok(Timed { elapsed_ns, checksum })
 }
-

@@ -171,37 +171,55 @@ Wasm 的每次迭代 JSON 行现在包含这些字段（来自 `vector_ivf_flat_
 | wasm_f16_warm | raw_f16 | host_cache=on + kernel_decoded_cache=on | 51.424 | 0.000 | 0.001 | 0.115 | 0.000 | 49.876 | 1.330 | 51.188 | 0 |
 | wasm_f16_cold | raw_f16 | host_cache=off + kernel_decoded_cache=off | 166.178 | 12.699 | 19.919 | 0.117 | 92.994 | 50.702 | 1.365 | 52.083 | 513 |
 
-#### 严格对齐 Stage profiling（Wasm `simd128` enabled）
+#### 严格对齐 Stage profiling（Wasm `simd128` / native SIMD）
 
-该表与上表的区别是：Wasm 内核编译时开启 `simd128`（`WASM_RUSTFLAGS='-C target-feature=+simd128'`），native 不变。  
-本地结果目录（一次样例）：`results/sift_ivf_aligned_profile_strict_20251216_101625/`
+为避免“native 没开 SIMD、Wasm 开了 SIMD”造成的错觉，本文档只保留当前代码的 *SIMD 对齐* 表（见下节）。
 
-| case | codec | cache | p50_wall_ms | p50_fetch_ms | p50_transfer_ms | p50_centroid_ms | p50_decode_ms | p50_dist_ms | p50_heap_ms | p50_compute_ms | chunks_fetched |
-|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| native_f32_warm | raw | posting_cache=on | 28.567 | - | - | 0.070 | 0.000 | 27.723 | 0.705 | 28.517 | - |
-| native_f32_cold | raw | posting_cache=off | 63.516 | - | - | 0.076 | 34.510 | 28.429 | 0.728 | 63.181 | - |
-| wasm_f32_warm | raw | host_cache=on | 20.018 | 0.000 | 7.850 | 0.038 | 0.000 | 10.493 | 1.316 | 11.817 | 0 |
-| wasm_f32_cold | raw | host_cache=off | 61.368 | 33.269 | 48.591 | 0.053 | 0.000 | 10.901 | 1.354 | 12.261 | 513 |
-| native_f16_warm | raw_f16 | posting_cache=on | 29.885 | - | - | 0.074 | 0.000 | 29.041 | 0.745 | 29.836 | - |
-| native_f16_cold | raw_f16 | posting_cache=off | 104.609 | - | - | 0.078 | 74.103 | 29.371 | 0.727 | 104.293 | - |
-| wasm_f16_warm | raw_f16 | host_cache=on + kernel_decoded_cache=on | 12.603 | 0.000 | 0.001 | 0.035 | 0.000 | 11.164 | 1.317 | 12.454 | 0 |
-| wasm_f16_cold | raw_f16 | host_cache=off + kernel_decoded_cache=off | 127.939 | 14.561 | 21.663 | 0.049 | 94.186 | 11.186 | 1.346 | 12.551 | 513 |
+#### 严格对齐 Stage profiling（native 显式 SIMD L2 + Wasm `simd128`）
 
-#### 严格对齐 Stage profiling（native `target-cpu=native` + Wasm `simd128`）
+该表用于回答“Wasm 内动态解压 + 搜索的阶段耗时，是否能和 native 对齐”。对齐方式：
 
-该表与上表的区别是：native 与 Wasm 都启用 SIMD（native：`NATIVE_RUSTFLAGS='-C target-cpu=native'`；Wasm：`WASM_RUSTFLAGS='-C target-feature=+simd128'`），属于论文里最“公平”的 SIMD 对齐组。  
-本地结果目录（一次样例）：`results/sift_ivf_aligned_profile_strict_20251216_114551/`
+- native：`l2_sq()` 使用显式 SIMD（aarch64 NEON / x86 SSE/AVX），不依赖 `-C target-cpu=native`
+- Wasm：编译时开启 `simd128`（`WASM_RUSTFLAGS='-C target-feature=+simd128'`）
+
+本地结果目录（一次样例）：`results/sift_ivf_aligned_profile_strict_20251216_121958/`
 
 | case | codec | cache | p50_wall_ms | p50_fetch_ms | p50_transfer_ms | p50_centroid_ms | p50_decode_ms | p50_dist_ms | p50_heap_ms | p50_compute_ms | chunks_fetched |
 |---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| native_f32_warm | raw | posting_cache=on | 30.771 | - | - | 0.074 | 0.000 | 29.876 | 0.745 | 30.715 | - |
-| native_f32_cold | raw | posting_cache=off | 63.378 | - | - | 0.077 | 32.976 | 29.266 | 0.714 | 63.030 | - |
-| wasm_f32_warm | raw | host_cache=on | 20.126 | 0.000 | 7.246 | 0.035 | 0.000 | 11.141 | 1.389 | 12.530 | 0 |
-| wasm_f32_cold | raw | host_cache=off | 51.476 | 25.162 | 39.298 | 0.043 | 0.000 | 10.266 | 1.305 | 11.565 | 513 |
-| native_f16_warm | raw_f16 | posting_cache=on | 30.340 | - | - | 0.072 | 0.000 | 29.464 | 0.720 | 30.294 | - |
-| native_f16_cold | raw_f16 | posting_cache=off | 104.836 | - | - | 0.078 | 74.486 | 29.278 | 0.716 | 104.522 | - |
-| wasm_f16_warm | raw_f16 | host_cache=on + kernel_decoded_cache=on | 15.641 | 0.000 | 0.001 | 0.042 | 0.000 | 13.823 | 1.655 | 15.457 | 0 |
-| wasm_f16_cold | raw_f16 | host_cache=off + kernel_decoded_cache=off | 138.909 | 12.404 | 19.908 | 0.042 | 104.532 | 12.156 | 1.504 | 13.660 | 513 |
+| native_f32_warm | raw | posting_cache=on | 10.790 | - | - | 0.030 | 0.000 | 9.967 | 0.737 | 10.736 | - |
+| native_f32_cold | raw | posting_cache=off | 43.711 | - | - | 0.036 | 32.922 | 9.650 | 0.722 | 43.342 | - |
+| wasm_f32_warm | raw | host_cache=on | 19.516 | 0.000 | 7.121 | 0.034 | 0.000 | 10.748 | 1.357 | 12.111 | 0 |
+| wasm_f32_cold | raw | host_cache=off | 53.016 | 27.061 | 40.992 | 0.043 | 0.000 | 10.228 | 1.288 | 11.510 | 513 |
+| native_f16_warm | raw_f16 | posting_cache=on | 11.212 | - | - | 0.032 | 0.000 | 10.360 | 0.761 | 11.153 | - |
+| native_f16_cold | raw_f16 | posting_cache=off | 84.722 | - | - | 0.037 | 74.187 | 9.527 | 0.727 | 84.385 | - |
+| wasm_f16_warm | raw_f16 | host_cache=on + kernel_decoded_cache=on | 14.071 | 0.000 | 0.001 | 0.037 | 0.000 | 12.446 | 1.471 | 13.909 | 0 |
+| wasm_f16_cold | raw_f16 | host_cache=off + kernel_decoded_cache=off | 133.969 | 12.259 | 19.752 | 0.046 | 100.266 | 11.679 | 1.442 | 13.129 | 513 |
+
+#### 距离计算核 microbench（native vs Wasm）
+
+Stage profiling 的 `dist_ms` 会受计时埋点影响（尤其是 Wasm 内部 `Instant` 采样），因此补一个“只测距离核吞吐”的 microbench：
+
+- native：直接调用 `fff_vindex::ivf_flat::l2_sq()`
+- Wasm：调用导出的 `l2_microbench_query_vs_vectors_f32_ffi()`，在 Wasm 内部做 tight loop（host 只做一次调用）
+
+命令（示例）：
+
+```bash
+# build wasm (no simd)
+CARGO_TARGET_DIR=/tmp/mb_wasm_nosimd cargo build -p ivf-kernel-basic --target wasm32-wasip1 --release
+# build wasm (simd128)
+RUSTFLAGS='-C target-feature=+simd128' CARGO_TARGET_DIR=/tmp/mb_wasm_simd cargo build -p ivf-kernel-basic --target wasm32-wasip1 --release
+# build + run microbench (native)
+CARGO_TARGET_DIR=/tmp/f3_native_strict cargo build -p fff-bench --release --example l2_kernel_microbench
+/tmp/f3_native_strict/release/examples/l2_kernel_microbench --wasm /tmp/mb_wasm_simd/wasm32-wasip1/release/ivf_kernel_basic.wasm
+```
+
+本机一次样例（`dim=128, count=16384, iters=200`，各跑 5 次取 median，checksum 对齐）：
+
+| wasm build | native ns/op (median) | wasm ns/op (median) | ratio (wasm/native) |
+|---|---:|---:|---:|
+| no simd | 16.939 | 46.593 | 2.742 |
+| simd128 | 16.867 | 9.665 | 0.572 |
 
 
 ### Size 拆分（同一份 index 文件）

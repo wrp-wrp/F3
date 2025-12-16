@@ -377,6 +377,53 @@ fn l2_sq(a: &[f32], b: &[f32]) -> f32 {
     l2_sq_impl(a, b)
 }
 
+/// Microbenchmark helper for the distance kernel.
+///
+/// Computes `iters * count` distances between:
+/// - `query_ptr`: a single `f32[dim]`
+/// - `vectors_ptr`: `f32[count * dim]` (row-major, contiguous)
+///
+/// Writes the accumulated sum (to prevent dead-code elimination) to `out_ptr` as `f32`.
+#[no_mangle]
+pub unsafe extern "C" fn l2_microbench_query_vs_vectors_f32_ffi(
+    query_ptr: u32,
+    vectors_ptr: u32,
+    count: u32,
+    dim: u32,
+    iters: u32,
+    out_ptr: u32,
+) -> u32 {
+    if query_ptr == 0 || vectors_ptr == 0 {
+        return 0;
+    }
+    let dim = dim as usize;
+    let count = count as usize;
+    if dim == 0 || count == 0 {
+        return 0;
+    }
+    let Some(vectors_len) = count.checked_mul(dim) else {
+        return 0;
+    };
+
+    let query = std::slice::from_raw_parts(query_ptr as *const f32, dim);
+    let vectors = std::slice::from_raw_parts(vectors_ptr as *const f32, vectors_len);
+
+    let mut acc = 0.0f32;
+    for _ in 0..(iters as usize) {
+        for i in 0..count {
+            let base = i * dim;
+            let v = &vectors[base..base + dim];
+            acc += l2_sq(query, v);
+        }
+    }
+    std::hint::black_box(acc);
+
+    if out_ptr != 0 {
+        *(out_ptr as *mut f32) = acc;
+    }
+    1
+}
+
 #[cfg(not(target_feature = "simd128"))]
 #[inline]
 fn l2_sq_impl(a: &[f32], b: &[f32]) -> f32 {

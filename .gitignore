@@ -21,3 +21,4 @@ results/sift_ivf_aligned_profile_strict_*/
 # for storing aws credentials
 .env 
 AGENTS.md
+results/

@@ -249,14 +249,136 @@ pub fn search_ivf_flat(
     Ok(out)
 }
 
-pub(crate) fn l2_sq(a: &[f32], b: &[f32]) -> f32 {
-    a.iter()
-        .zip(b.iter())
-        .map(|(x, y)| {
-            let d = x - y;
-            d * d
-        })
-        .sum()
+#[inline]
+pub fn l2_sq(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        // Apple Silicon (and most aarch64 targets) always has NEON.
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            // SAFETY: guarded by runtime feature detection.
+            unsafe { return l2_sq_neon(a, b) };
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx") {
+            // SAFETY: guarded by runtime feature detection.
+            unsafe { return l2_sq_avx(a, b) };
+        }
+        if std::arch::is_x86_feature_detected!("sse") {
+            // SAFETY: guarded by runtime feature detection.
+            unsafe { return l2_sq_sse(a, b) };
+        }
+    }
+
+    l2_sq_scalar(a, b)
+}
+
+#[inline]
+fn l2_sq_scalar(a: &[f32], b: &[f32]) -> f32 {
+    let n = a.len().min(b.len());
+    let mut sum = 0.0f32;
+    for i in 0..n {
+        let d = a[i] - b[i];
+        sum += d * d;
+    }
+    sum
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+#[target_feature(enable = "neon")]
+unsafe fn l2_sq_neon(a: &[f32], b: &[f32]) -> f32 {
+    use core::arch::aarch64::*;
+
+    let n = a.len().min(b.len());
+    let mut acc = vdupq_n_f32(0.0);
+    let mut i = 0usize;
+
+    let ap = a.as_ptr();
+    let bp = b.as_ptr();
+    while i + 4 <= n {
+        let va = vld1q_f32(ap.add(i));
+        let vb = vld1q_f32(bp.add(i));
+        let d = vsubq_f32(va, vb);
+        acc = vmlaq_f32(acc, d, d);
+        i += 4;
+    }
+
+    let mut lanes = [0.0f32; 4];
+    vst1q_f32(lanes.as_mut_ptr(), acc);
+    let mut sum = lanes[0] + lanes[1] + lanes[2] + lanes[3];
+    while i < n {
+        let d = *ap.add(i) - *bp.add(i);
+        sum += d * d;
+        i += 1;
+    }
+    sum
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "sse")]
+unsafe fn l2_sq_sse(a: &[f32], b: &[f32]) -> f32 {
+    use core::arch::x86_64::*;
+
+    let n = a.len().min(b.len());
+    let mut acc = _mm_setzero_ps();
+    let mut i = 0usize;
+    let ap = a.as_ptr();
+    let bp = b.as_ptr();
+
+    while i + 4 <= n {
+        let va = _mm_loadu_ps(ap.add(i));
+        let vb = _mm_loadu_ps(bp.add(i));
+        let d = _mm_sub_ps(va, vb);
+        acc = _mm_add_ps(acc, _mm_mul_ps(d, d));
+        i += 4;
+    }
+
+    let mut lanes = [0.0f32; 4];
+    _mm_storeu_ps(lanes.as_mut_ptr(), acc);
+    let mut sum = lanes[0] + lanes[1] + lanes[2] + lanes[3];
+    while i < n {
+        let d = *ap.add(i) - *bp.add(i);
+        sum += d * d;
+        i += 1;
+    }
+    sum
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx")]
+unsafe fn l2_sq_avx(a: &[f32], b: &[f32]) -> f32 {
+    use core::arch::x86_64::*;
+
+    let n = a.len().min(b.len());
+    let mut acc = _mm256_setzero_ps();
+    let mut i = 0usize;
+    let ap = a.as_ptr();
+    let bp = b.as_ptr();
+
+    while i + 8 <= n {
+        let va = _mm256_loadu_ps(ap.add(i));
+        let vb = _mm256_loadu_ps(bp.add(i));
+        let d = _mm256_sub_ps(va, vb);
+        acc = _mm256_add_ps(acc, _mm256_mul_ps(d, d));
+        i += 8;
+    }
+
+    let mut lanes = [0.0f32; 8];
+    _mm256_storeu_ps(lanes.as_mut_ptr(), acc);
+    let mut sum = lanes.iter().copied().sum::<f32>();
+    while i < n {
+        let d = *ap.add(i) - *bp.add(i);
+        sum += d * d;
+        i += 1;
+    }
+    sum
 }
 
 fn load_ivf_flat_index_binary(index_path: &Path) -> Result<IvfFlatIndex> {

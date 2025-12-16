@@ -187,6 +187,22 @@ Wasm 的每次迭代 JSON 行现在包含这些字段（来自 `vector_ivf_flat_
 | wasm_f16_warm | raw_f16 | host_cache=on + kernel_decoded_cache=on | 12.603 | 0.000 | 0.001 | 0.035 | 0.000 | 11.164 | 1.317 | 12.454 | 0 |
 | wasm_f16_cold | raw_f16 | host_cache=off + kernel_decoded_cache=off | 127.939 | 14.561 | 21.663 | 0.049 | 94.186 | 11.186 | 1.346 | 12.551 | 513 |
 
+#### 严格对齐 Stage profiling（native `target-cpu=native` + Wasm `simd128`）
+
+该表与上表的区别是：native 与 Wasm 都启用 SIMD（native：`NATIVE_RUSTFLAGS='-C target-cpu=native'`；Wasm：`WASM_RUSTFLAGS='-C target-feature=+simd128'`），属于论文里最“公平”的 SIMD 对齐组。  
+本地结果目录（一次样例）：`results/sift_ivf_aligned_profile_strict_20251216_114551/`
+
+| case | codec | cache | p50_wall_ms | p50_fetch_ms | p50_transfer_ms | p50_centroid_ms | p50_decode_ms | p50_dist_ms | p50_heap_ms | p50_compute_ms | chunks_fetched |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| native_f32_warm | raw | posting_cache=on | 30.771 | - | - | 0.074 | 0.000 | 29.876 | 0.745 | 30.715 | - |
+| native_f32_cold | raw | posting_cache=off | 63.378 | - | - | 0.077 | 32.976 | 29.266 | 0.714 | 63.030 | - |
+| wasm_f32_warm | raw | host_cache=on | 20.126 | 0.000 | 7.246 | 0.035 | 0.000 | 11.141 | 1.389 | 12.530 | 0 |
+| wasm_f32_cold | raw | host_cache=off | 51.476 | 25.162 | 39.298 | 0.043 | 0.000 | 10.266 | 1.305 | 11.565 | 513 |
+| native_f16_warm | raw_f16 | posting_cache=on | 30.340 | - | - | 0.072 | 0.000 | 29.464 | 0.720 | 30.294 | - |
+| native_f16_cold | raw_f16 | posting_cache=off | 104.836 | - | - | 0.078 | 74.486 | 29.278 | 0.716 | 104.522 | - |
+| wasm_f16_warm | raw_f16 | host_cache=on + kernel_decoded_cache=on | 15.641 | 0.000 | 0.001 | 0.042 | 0.000 | 13.823 | 1.655 | 15.457 | 0 |
+| wasm_f16_cold | raw_f16 | host_cache=off + kernel_decoded_cache=off | 138.909 | 12.404 | 19.908 | 0.042 | 104.532 | 12.156 | 1.504 | 13.660 | 513 |
+
 
 ### Size 拆分（同一份 index 文件）
 

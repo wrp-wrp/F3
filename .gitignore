@@ -1,5 +1,6 @@
 /target
 target_fair_*/
+target_profile_strict_*/
 .vscode
 *.log
 __pycache__

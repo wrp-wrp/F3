@@ -205,8 +205,7 @@ impl WasmIvfFlatKernel {
                         .get_export("memory")
                         .and_then(|e| e.into_memory())
                         .ok_or_else(|| anyhow::anyhow!("wasm export `memory` not found"))?;
-                    let data = mem.data(&caller);
-
+                    
                     let query_off = query_ptr as usize;
                     let vectors_off = vectors_ptr as usize;
                     let out_off = out_ptr as usize;
@@ -214,27 +213,42 @@ impl WasmIvfFlatKernel {
                     let vectors_bytes_len = vectors_len * 4;
                     let out_bytes_len = count * 4;
 
-                    if query_off.checked_add(query_bytes_len).unwrap_or(usize::MAX) > data.len() {
+                    let data_mut = mem.data_mut(&mut caller);
+
+                    if query_off.checked_add(query_bytes_len).unwrap_or(usize::MAX) > data_mut.len() {
                         bail!("query oob");
                     }
-                    if vectors_off.checked_add(vectors_bytes_len).unwrap_or(usize::MAX) > data.len() {
+                    if vectors_off.checked_add(vectors_bytes_len).unwrap_or(usize::MAX) > data_mut.len() {
                         bail!("vectors oob");
                     }
-                    let data_mut = mem.data_mut(&mut caller);
                     if out_off.checked_add(out_bytes_len).unwrap_or(usize::MAX) > data_mut.len() {
                         bail!("out oob");
                     }
 
-                    let query: &[f32] = bytemuck::try_cast_slice(&data[query_off..query_off + query_bytes_len])
-                        .map_err(|_| anyhow::anyhow!("unaligned query"))?;
-                    let vectors: &[f32] = bytemuck::try_cast_slice(&data[vectors_off..vectors_off + vectors_bytes_len])
-                        .map_err(|_| anyhow::anyhow!("unaligned vectors"))?;
-                    let out: &mut [f32] = bytemuck::try_cast_slice_mut(&mut data_mut[out_off..out_off + out_bytes_len])
-                        .map_err(|_| anyhow::anyhow!("unaligned out"))?;
+                    // Check alignment
+                    if query_off % 4 != 0 || vectors_off % 4 != 0 || out_off % 4 != 0 {
+                        bail!("unaligned pointers");
+                    }
+                    // We also need to check if the base pointer is aligned, but Wasm memory usually is.
+                    // bytemuck::try_cast_slice checks this.
+                    
+                    let query: Vec<f32> = bytemuck::try_cast_slice(&data_mut[query_off..query_off + query_bytes_len])
+                        .map_err(|_| anyhow::anyhow!("unaligned query"))?
+                        .to_vec();
 
+                    // Process one by one to avoid simultaneous borrow issues
                     for i in 0..count {
                         let base = i * dim;
-                        out[i] = crate::ivf_flat::l2_sq(query, &vectors[base..base + dim]);
+                        let vec_byte_start = vectors_off + base * 4;
+                        let vec_bytes = &data_mut[vec_byte_start..vec_byte_start + dim * 4];
+                        let vec_slice: &[f32] = bytemuck::try_cast_slice(vec_bytes)
+                             .map_err(|_| anyhow::anyhow!("unaligned vector {}", i))?;
+                        
+                        let dist = crate::ivf_flat::l2_sq(&query, vec_slice);
+                        
+                        let out_byte_start = out_off + i * 4;
+                        let out_bytes_slice = &mut data_mut[out_byte_start..out_byte_start + 4];
+                        out_bytes_slice.copy_from_slice(bytemuck::bytes_of(&dist));
                     }
                     Ok(1)
                 })();

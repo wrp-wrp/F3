@@ -3390,6 +3390,7 @@ dependencies = [
  "arrow",
  "arrow-array 53.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "arrow-schema 53.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "bytemuck",
  "byteorder",
  "fff-format",
  "fff-poc",

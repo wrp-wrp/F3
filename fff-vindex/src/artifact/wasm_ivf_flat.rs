@@ -89,6 +89,7 @@ pub struct FetchStats {
     pub raw_bytes_decoded: u64,
     pub fetch_time_ns: u64,
     pub transfer_time_ns: u64,
+    pub host_copy_time_ns: u64,
     pub total_time_ns: u64,
     pub fetched_chunk_ids_sample: Vec<u32>,
     pub cache_miss_chunk_ids_sample: Vec<u32>,
@@ -161,17 +162,31 @@ impl WasmIvfFlatKernel {
                         .get_export("memory")
                         .and_then(|e| e.into_memory())
                         .ok_or_else(|| anyhow::anyhow!("wasm export `memory` not found"))?;
-                    let start = Instant::now();
+                    
+                    let start_total = Instant::now();
+                    
+                    // 1. Get bytes (Cache or I/O)
                     let bytes = {
                         let state = &mut caller.data_mut().host;
                         state.get_chunk_bytes(chunk_id)?
                     };
+                    
                     let n = u32::try_from(bytes.len()).unwrap_or(0);
                     if n == 0 || n > dst_len {
                         return Ok(0);
                     }
+
+                    // 2. Write to WASM memory (Copy)
+                    let start_copy = Instant::now();
                     mem.write(&mut caller, dst_ptr as usize, &bytes)?;
-                    caller.data_mut().host.stats.transfer_time_ns += start.elapsed().as_nanos() as u64;
+                    let copy_time = start_copy.elapsed().as_nanos() as u64;
+
+                    // Update stats
+                    let total_time = start_total.elapsed().as_nanos() as u64;
+                    let stats = &mut caller.data_mut().host.stats;
+                    stats.host_copy_time_ns += copy_time;
+                    stats.transfer_time_ns += total_time;
+
                     Ok(n)
                 })();
                 res.unwrap_or(0)

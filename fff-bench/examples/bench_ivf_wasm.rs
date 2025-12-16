@@ -179,6 +179,7 @@ fn main() -> anyhow::Result<()> {
             wasm_cold_stats.raw_bytes_decoded += s.raw_bytes_decoded;
             wasm_cold_stats.fetch_time_ns += s.fetch_time_ns;
             wasm_cold_stats.transfer_time_ns += s.transfer_time_ns;
+            wasm_cold_stats.host_copy_time_ns += s.host_copy_time_ns;
             wasm_cold_stats.total_time_ns += s.total_time_ns;
         }
     }
@@ -212,6 +213,7 @@ fn main() -> anyhow::Result<()> {
             wasm_warm_stats.chunks_fetched += s.chunks_fetched;
             wasm_warm_stats.cache_hits += s.cache_hits; // Host cache hits
             wasm_warm_stats.total_time_ns += s.total_time_ns;
+            wasm_warm_stats.host_copy_time_ns += s.host_copy_time_ns;
             
             wasm_warm_kernel_stats.decode_time_ns += ks.decode_time_ns;
             wasm_warm_kernel_stats.compute_time_ns += ks.compute_time_ns;
@@ -250,6 +252,7 @@ fn main() -> anyhow::Result<()> {
             wasm_hostdist_stats.chunks_fetched += s.chunks_fetched;
             wasm_hostdist_stats.cache_hits += s.cache_hits;
             wasm_hostdist_stats.total_time_ns += s.total_time_ns;
+            wasm_hostdist_stats.host_copy_time_ns += s.host_copy_time_ns;
             
             wasm_hostdist_kernel_stats.decode_time_ns += ks.decode_time_ns;
             wasm_hostdist_kernel_stats.compute_time_ns += ks.compute_time_ns;
@@ -265,27 +268,32 @@ fn main() -> anyhow::Result<()> {
     }
 
 
-    if args.csv {
+        if args.csv {
 
-        println!("native,{},{},{},0,0,0,0,{}", 
+
+            println!("native,{},{},{},0,0,0,0,0,{}", 
             args.nq, args.nprobe, native_avg.as_secs_f64()*1000.0, args.posting_codec);
-        println!("wasm_cold,{},{},{},{},0,0,0,{}", 
+        println!("wasm_cold,{},{},{},{},0,0,0,{},{}", 
             args.nq, args.nprobe, wasm_cold_avg.as_secs_f64()*1000.0,
-            wasm_cold_stats.chunks_fetched as f64 / args.iters as f64, args.posting_codec);
-        println!("wasm_warm,{},{},{},{},{},{},{},{}", 
+            wasm_cold_stats.chunks_fetched as f64 / args.iters as f64, 
+            (wasm_cold_stats.host_copy_time_ns as f64 / args.iters as f64) / 1_000_000.0,
+            args.posting_codec);
+        println!("wasm_warm,{},{},{},{},{},{},{},{},{}", 
             args.nq, args.nprobe, wasm_warm_avg.as_secs_f64()*1000.0,
             wasm_warm_stats.chunks_fetched as f64 / args.iters as f64,
             wasm_warm_kernel_stats.decoded_cache_hits as f64 / args.iters as f64,
             (wasm_warm_kernel_stats.decode_time_ns as f64 / args.iters as f64) / 1_000_000.0,
             (wasm_warm_kernel_stats.compute_time_ns as f64 / args.iters as f64) / 1_000_000.0,
+            (wasm_warm_stats.host_copy_time_ns as f64 / args.iters as f64) / 1_000_000.0,
             args.posting_codec
         );
-        println!("wasm_warm_hostdist,{},{},{},{},{},{},{},{}", 
+        println!("wasm_warm_hostdist,{},{},{},{},{},{},{},{},{}", 
             args.nq, args.nprobe, wasm_hostdist_avg.as_secs_f64()*1000.0,
             wasm_hostdist_stats.chunks_fetched as f64 / args.iters as f64,
             wasm_hostdist_kernel_stats.decoded_cache_hits as f64 / args.iters as f64,
             (wasm_hostdist_kernel_stats.decode_time_ns as f64 / args.iters as f64) / 1_000_000.0,
             (wasm_hostdist_kernel_stats.compute_time_ns as f64 / args.iters as f64) / 1_000_000.0,
+            (wasm_hostdist_stats.host_copy_time_ns as f64 / args.iters as f64) / 1_000_000.0,
             args.posting_codec
         );
     }

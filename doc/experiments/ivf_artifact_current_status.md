@@ -154,19 +154,6 @@ Wasm 的每次迭代 JSON 行现在包含这些字段（来自 `vector_ivf_flat_
 - `native_f16_warm ≈ 28.177ms`，`native_f16_cold ≈ 102.289ms`
 - `wasm_f16_warm ≈ 50.215ms`，`wasm_f16_cold ≈ 158.466ms`
 
-#### 严格对齐实验结果（SIFT100K，nq=32，p50 over iterations）
-
-| case | codec | cache | index_bytes | p50_wall_ms | fetch_ms | transfer_ms | decode_ms | compute_ms | chunks_fetched |
-|---|---|---|---:|---:|---:|---:|---:|---:|---:|
-| native_f32_warm | raw | posting_cache=on | 51,640,895 | 27.616 | - | - | - | - | - |
-| native_f32_cold | raw | posting_cache=off | 51,640,895 | 59.186 | - | - | - | - | - |
-| wasm_f32_warm | raw | host_cache=on | 51,640,895 | 57.634 | 0.000 | 7.460 | 0.000 | 49.737 | 0 |
-| wasm_f32_cold | raw | host_cache=off | 51,640,895 | 89.745 | 25.665 | 40.039 | 0.000 | 49.016 | 513 |
-| native_f16_warm | raw_f16 | posting_cache=on | 26,041,127 | 28.177 | - | - | - | - | - |
-| native_f16_cold | raw_f16 | posting_cache=off | 26,041,127 | 102.289 | - | - | - | - | - |
-| wasm_f16_warm | raw_f16 | host_cache=on + kernel_decoded_cache=on | 26,041,127 | 50.215 | 0.000 | 0.001 | 0.000 | 50.046 | 0 |
-| wasm_f16_cold | raw_f16 | host_cache=off + kernel_decoded_cache=off | 26,041,127 | 158.466 | 10.784 | 17.629 | 90.911 | 49.116 | 513 |
-
 #### 严格对齐 Stage profiling 结果（SIFT100K，nq=32，p50 over iterations）
 
 该表来自 `bash scripts/run_sift_ivf_aligned_profile_strict.sh`（每个 case 都开启 `--profile-stages`），因此 native 侧也会给出 `centroid/decode/dist/heap`，Wasm 侧同时给出 `fetch/transfer/decode/compute`。
@@ -183,6 +170,22 @@ Wasm 的每次迭代 JSON 行现在包含这些字段（来自 `vector_ivf_flat_
 | native_f16_cold | raw_f16 | posting_cache=off | 105.222 | - | - | 0.078 | 75.084 | 29.380 | 0.736 | 104.896 | - |
 | wasm_f16_warm | raw_f16 | host_cache=on + kernel_decoded_cache=on | 51.424 | 0.000 | 0.001 | 0.115 | 0.000 | 49.876 | 1.330 | 51.188 | 0 |
 | wasm_f16_cold | raw_f16 | host_cache=off + kernel_decoded_cache=off | 166.178 | 12.699 | 19.919 | 0.117 | 92.994 | 50.702 | 1.365 | 52.083 | 513 |
+
+#### 严格对齐 Stage profiling（Wasm `simd128` enabled）
+
+该表与上表的区别是：Wasm 内核编译时开启 `simd128`（`WASM_RUSTFLAGS='-C target-feature=+simd128'`），native 不变。  
+本地结果目录（一次样例）：`results/sift_ivf_aligned_profile_strict_20251216_101625/`
+
+| case | codec | cache | p50_wall_ms | p50_fetch_ms | p50_transfer_ms | p50_centroid_ms | p50_decode_ms | p50_dist_ms | p50_heap_ms | p50_compute_ms | chunks_fetched |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| native_f32_warm | raw | posting_cache=on | 28.567 | - | - | 0.070 | 0.000 | 27.723 | 0.705 | 28.517 | - |
+| native_f32_cold | raw | posting_cache=off | 63.516 | - | - | 0.076 | 34.510 | 28.429 | 0.728 | 63.181 | - |
+| wasm_f32_warm | raw | host_cache=on | 20.018 | 0.000 | 7.850 | 0.038 | 0.000 | 10.493 | 1.316 | 11.817 | 0 |
+| wasm_f32_cold | raw | host_cache=off | 61.368 | 33.269 | 48.591 | 0.053 | 0.000 | 10.901 | 1.354 | 12.261 | 513 |
+| native_f16_warm | raw_f16 | posting_cache=on | 29.885 | - | - | 0.074 | 0.000 | 29.041 | 0.745 | 29.836 | - |
+| native_f16_cold | raw_f16 | posting_cache=off | 104.609 | - | - | 0.078 | 74.103 | 29.371 | 0.727 | 104.293 | - |
+| wasm_f16_warm | raw_f16 | host_cache=on + kernel_decoded_cache=on | 12.603 | 0.000 | 0.001 | 0.035 | 0.000 | 11.164 | 1.317 | 12.454 | 0 |
+| wasm_f16_cold | raw_f16 | host_cache=off + kernel_decoded_cache=off | 127.939 | 14.561 | 21.663 | 0.049 | 94.186 | 11.186 | 1.346 | 12.551 | 513 |
 
 
 ### Size 拆分（同一份 index 文件）

@@ -374,13 +374,58 @@ fn decode_posting_delta_f16(bytes: &[u8], dim: usize) -> Option<DecodedPosting> 
 }
 
 fn l2_sq(a: &[f32], b: &[f32]) -> f32 {
-    a.iter()
-        .zip(b.iter())
-        .map(|(x, y)| {
-            let d = x - y;
-            d * d
-        })
-        .sum()
+    l2_sq_impl(a, b)
+}
+
+#[cfg(not(target_feature = "simd128"))]
+#[inline]
+fn l2_sq_impl(a: &[f32], b: &[f32]) -> f32 {
+    l2_sq_scalar(a, b)
+}
+
+#[cfg(target_feature = "simd128")]
+#[inline]
+fn l2_sq_impl(a: &[f32], b: &[f32]) -> f32 {
+    unsafe { l2_sq_simd128(a, b) }
+}
+
+#[cfg(not(target_feature = "simd128"))]
+#[inline]
+fn l2_sq_scalar(a: &[f32], b: &[f32]) -> f32 {
+    let n = a.len().min(b.len());
+    let mut sum = 0.0f32;
+    for i in 0..n {
+        let d = a[i] - b[i];
+        sum += d * d;
+    }
+    sum
+}
+
+#[cfg(target_feature = "simd128")]
+#[inline]
+unsafe fn l2_sq_simd128(a: &[f32], b: &[f32]) -> f32 {
+    use core::arch::wasm32::*;
+    let n = a.len().min(b.len());
+    let mut acc = f32x4_splat(0.0);
+    let chunks = n / 4;
+    let ap = a.as_ptr();
+    let bp = b.as_ptr();
+    for i in 0..chunks {
+        let va = v128_load(ap.add(i * 4) as *const v128);
+        let vb = v128_load(bp.add(i * 4) as *const v128);
+        let d = f32x4_sub(va, vb);
+        acc = f32x4_add(acc, f32x4_mul(d, d));
+    }
+    // Horizontal add 4 lanes.
+    let mut sum = f32x4_extract_lane::<0>(acc)
+        + f32x4_extract_lane::<1>(acc)
+        + f32x4_extract_lane::<2>(acc)
+        + f32x4_extract_lane::<3>(acc);
+    for i in (chunks * 4)..n {
+        let d = a[i] - b[i];
+        sum += d * d;
+    }
+    sum
 }
 
 unsafe fn fetch_chunk(chunk_id: u32) -> Option<Vec<u8>> {

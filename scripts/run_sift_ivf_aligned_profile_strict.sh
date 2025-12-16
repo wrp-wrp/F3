@@ -26,7 +26,11 @@ if [[ ! -f "$base_f3" ]]; then
 fi
 
 echo "[2/4] Build Wasm kernel"
-cargo build -p ivf-kernel-basic --target wasm32-wasip1 --release
+WASM_RUSTFLAGS="${WASM_RUSTFLAGS:-}"
+if [[ -n "$WASM_RUSTFLAGS" ]]; then
+  echo "WASM_RUSTFLAGS=$WASM_RUSTFLAGS"
+fi
+RUSTFLAGS="$WASM_RUSTFLAGS" cargo build -p ivf-kernel-basic --target wasm32-wasip1 --release
 wasm_kernel="$root/target/wasm32-wasip1/release/ivf_kernel_basic.wasm"
 
 echo "[3/4] Run strict stage-profile matrix -> $out_dir"

@@ -317,6 +317,10 @@ fn main() -> Result<()> {
             }
             let wall_ms = run_start.elapsed().as_secs_f64() * 1000.0;
             if args.json {
+                let compute_ns = centroid_ns
+                    .saturating_add(decode_ns)
+                    .saturating_add(dist_ns)
+                    .saturating_add(heap_ns);
                 println!(
                     "{}",
                     json!({
@@ -332,6 +336,7 @@ fn main() -> Result<()> {
                         "decode_ms": (decode_ns as f64) / 1e6,
                         "dist_ms": (dist_ns as f64) / 1e6,
                         "heap_ms": (heap_ns as f64) / 1e6,
+                        "compute_ms": (compute_ns as f64) / 1e6,
                         "posting_cache_hits": cache_hits,
                         "posting_cache_misses": cache_misses,
                     })

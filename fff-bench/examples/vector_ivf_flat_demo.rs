@@ -79,6 +79,10 @@ struct Args {
     #[arg(long, default_value_t = false)]
     artifact_wasm_no_cache: bool,
 
+    /// Let the Wasm kernel call back into host for the L2 distance batch kernel (hybrid mode).
+    #[arg(long, default_value_t = false)]
+    artifact_wasm_host_dist: bool,
+
     /// Decoded posting cache budget inside Wasm kernel (bytes). Set 0 to disable.
     #[arg(long, default_value_t = 201_326_592)]
     artifact_wasm_decoded_cache_bytes: u32,
@@ -147,6 +151,7 @@ fn main() -> Result<()> {
                     "nprobe": args.nprobe,
                     "posting_codec": args.artifact_posting_codec,
                     "cache_enabled": !args.artifact_wasm_no_cache,
+                    "host_dist": args.artifact_wasm_host_dist,
                     "decoded_cache_budget_bytes": args.artifact_wasm_decoded_cache_bytes,
                     "profile_stages": args.profile_stages,
                 })
@@ -157,6 +162,7 @@ fn main() -> Result<()> {
         let mut kernel = WasmIvfFlatKernel::load(wasm_path, Arc::clone(&artifact))
             .with_context(|| "load wasm ivf-flat kernel")?;
         kernel.set_cache_enabled(!args.artifact_wasm_no_cache);
+        kernel.set_use_host_dist(args.artifact_wasm_host_dist);
         kernel.set_decoded_cache_budget_bytes(args.artifact_wasm_decoded_cache_bytes);
         kernel.set_profile_stages(args.profile_stages);
         let nq = args.nq;
@@ -198,6 +204,7 @@ fn main() -> Result<()> {
                         "nprobe": args.nprobe,
                         "posting_codec": args.artifact_posting_codec,
                         "cache_enabled": !args.artifact_wasm_no_cache,
+                        "host_dist": args.artifact_wasm_host_dist,
                         "decoded_cache_budget_bytes": args.artifact_wasm_decoded_cache_bytes,
                         "profile_stages": args.profile_stages,
                         "wall_ms": wall_ms,

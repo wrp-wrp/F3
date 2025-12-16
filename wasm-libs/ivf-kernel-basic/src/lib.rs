@@ -10,6 +10,7 @@ use std::time::Instant;
 extern "C" {
     fn host_chunk_len(chunk_id: u32) -> u32;
     fn host_read_chunk(chunk_id: u32, dst_ptr: u32, dst_len: u32) -> u32;
+    fn host_l2_sq_batch_f32(query_ptr: u32, vectors_ptr: u32, count: u32, dim: u32, out_ptr: u32) -> u32;
 }
 
 #[no_mangle]
@@ -133,6 +134,15 @@ fn profile_stages_enabled() -> bool {
     *profile_stages_cell().lock().unwrap()
 }
 
+fn use_host_dist_cell() -> &'static Mutex<bool> {
+    static USE: OnceLock<Mutex<bool>> = OnceLock::new();
+    USE.get_or_init(|| Mutex::new(false))
+}
+
+fn use_host_dist_enabled() -> bool {
+    *use_host_dist_cell().lock().unwrap()
+}
+
 #[no_mangle]
 pub extern "C" fn ivf_set_decoded_cache_budget_ffi(bytes: u32) {
     decoded_cache().lock().unwrap().set_budget(bytes as usize);
@@ -141,6 +151,37 @@ pub extern "C" fn ivf_set_decoded_cache_budget_ffi(bytes: u32) {
 #[no_mangle]
 pub extern "C" fn ivf_set_profile_stages_ffi(enabled: u32) {
     *profile_stages_cell().lock().unwrap() = enabled != 0;
+}
+
+#[no_mangle]
+pub extern "C" fn ivf_set_use_host_dist_ffi(enabled: u32) {
+    *use_host_dist_cell().lock().unwrap() = enabled != 0;
+}
+
+#[inline]
+fn l2_sq_batch_f32(query: &[f32], vectors: &[f32], dim: usize, out: &mut Vec<f32>) {
+    let dim = dim.max(1);
+    let count = vectors.len() / dim;
+    out.clear();
+    out.resize(count, 0.0);
+    if use_host_dist_enabled() {
+        let ok = unsafe {
+            host_l2_sq_batch_f32(
+                query.as_ptr() as u32,
+                vectors.as_ptr() as u32,
+                count as u32,
+                dim as u32,
+                out.as_mut_ptr() as u32,
+            )
+        };
+        if ok != 0 {
+            return;
+        }
+    }
+    for i in 0..count {
+        let base = i * dim;
+        out[i] = l2_sq(query, &vectors[base..base + dim]);
+    }
 }
 
 /// Writes 5x u64 to `out_ptr`:
@@ -883,12 +924,8 @@ pub unsafe extern "C" fn ivf_flat_search_batch_ffi(
                     decoded_cache_hits += 1;
                     if profile {
                         scratch_dists.clear();
-                        scratch_dists.reserve(posting.row_ids.len());
                         let start_dist = Instant::now();
-                        for pos in 0..posting.row_ids.len() {
-                            let v = &posting.vectors[pos * dim as usize..(pos + 1) * dim as usize];
-                            scratch_dists.push(l2_sq(query, v));
-                        }
+                        l2_sq_batch_f32(query, &posting.vectors, dim as usize, &mut scratch_dists);
                         dist_ns += start_dist.elapsed().as_nanos() as u64;
 
                         let start_heap = Instant::now();
@@ -898,10 +935,10 @@ pub unsafe extern "C" fn ivf_flat_search_batch_ffi(
                         heap_ns += start_heap.elapsed().as_nanos() as u64;
                     } else {
                         let start_compute = Instant::now();
+                        scratch_dists.clear();
+                        l2_sq_batch_f32(query, &posting.vectors, dim as usize, &mut scratch_dists);
                         for (pos, &row_id) in posting.row_ids.iter().enumerate() {
-                            let v =
-                                &posting.vectors[pos * dim as usize..(pos + 1) * dim as usize];
-                            heap_push_topk(&mut heap, k, row_id, l2_sq(query, v));
+                            heap_push_topk(&mut heap, k, row_id, scratch_dists[pos]);
                         }
                         compute_ns += start_compute.elapsed().as_nanos() as u64;
                     }
@@ -922,12 +959,8 @@ pub unsafe extern "C" fn ivf_flat_search_batch_ffi(
                 let Some(decoded) = decoded else { continue; };
                 if profile {
                     scratch_dists.clear();
-                    scratch_dists.reserve(decoded.row_ids.len());
                     let start_dist = Instant::now();
-                    for pos in 0..decoded.row_ids.len() {
-                        let v = &decoded.vectors[pos * dim as usize..(pos + 1) * dim as usize];
-                        scratch_dists.push(l2_sq(query, v));
-                    }
+                    l2_sq_batch_f32(query, &decoded.vectors, dim as usize, &mut scratch_dists);
                     dist_ns += start_dist.elapsed().as_nanos() as u64;
 
                     let start_heap = Instant::now();
@@ -937,9 +970,10 @@ pub unsafe extern "C" fn ivf_flat_search_batch_ffi(
                     heap_ns += start_heap.elapsed().as_nanos() as u64;
                 } else {
                     let start_compute = Instant::now();
+                    scratch_dists.clear();
+                    l2_sq_batch_f32(query, &decoded.vectors, dim as usize, &mut scratch_dists);
                     for (pos, &row_id) in decoded.row_ids.iter().enumerate() {
-                        let v = &decoded.vectors[pos * dim as usize..(pos + 1) * dim as usize];
-                        heap_push_topk(&mut heap, k, row_id, l2_sq(query, v));
+                        heap_push_topk(&mut heap, k, row_id, scratch_dists[pos]);
                     }
                     compute_ns += start_compute.elapsed().as_nanos() as u64;
                 }

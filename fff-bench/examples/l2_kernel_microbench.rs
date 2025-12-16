@@ -176,6 +176,17 @@ fn prepare_wasm(wasm_path: &PathBuf, query: &[f32], vectors: &[f32]) -> Result<(
         "host_read_chunk",
         |_caller: Caller<'_, WasmState>, _chunk_id: u32, _dst_ptr: u32, _dst_len: u32| -> u32 { 0 },
     )?;
+    linker.func_wrap(
+        "env",
+        "host_l2_sq_batch_f32",
+        |_caller: Caller<'_, WasmState>,
+         _query_ptr: u32,
+         _vectors_ptr: u32,
+         _count: u32,
+         _dim: u32,
+         _out_ptr: u32|
+         -> u32 { 0 },
+    )?;
 
     let wasi = WasiCtxBuilder::new().inherit_stdio().build();
     let mut store = Store::new(&engine, WasmState { wasi });

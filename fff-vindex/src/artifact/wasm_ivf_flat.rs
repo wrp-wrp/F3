@@ -114,11 +114,13 @@ pub struct WasmIvfFlatKernel {
     search_batch: TypedFunc<(u32, u32, u32, u32, u32, u32, u32, u32, u32, u32), u32>,
     set_decoded_cache_budget: Option<TypedFunc<u32, ()>>,
     set_profile_stages: Option<TypedFunc<u32, ()>>,
+    set_use_host_dist: Option<TypedFunc<u32, ()>>,
     last_stats: Option<TypedFunc<u32, u32>>,
     last_stats_v2: Option<TypedFunc<u32, u32>>,
     decoded_cache_budget_bytes: u32,
     last_kernel_stats: KernelStats,
     profile_stages: bool,
+    use_host_dist: bool,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -176,6 +178,70 @@ impl WasmIvfFlatKernel {
             },
         )?;
 
+        linker.func_wrap(
+            "env",
+            "host_l2_sq_batch_f32",
+            |mut caller: Caller<'_, WasmState>,
+             query_ptr: u32,
+             vectors_ptr: u32,
+             count: u32,
+             dim: u32,
+             out_ptr: u32|
+             -> u32 {
+                let res: Result<u32> = (|| {
+                    if query_ptr == 0 || vectors_ptr == 0 || out_ptr == 0 {
+                        bail!("null ptr");
+                    }
+                    let dim = dim as usize;
+                    let count = count as usize;
+                    if dim == 0 || count == 0 {
+                        bail!("dim/count=0");
+                    }
+                    let Some(vectors_len) = count.checked_mul(dim) else {
+                        bail!("overflow");
+                    };
+
+                    let mem = caller
+                        .get_export("memory")
+                        .and_then(|e| e.into_memory())
+                        .ok_or_else(|| anyhow::anyhow!("wasm export `memory` not found"))?;
+                    let data = mem.data(&caller);
+
+                    let query_off = query_ptr as usize;
+                    let vectors_off = vectors_ptr as usize;
+                    let out_off = out_ptr as usize;
+                    let query_bytes_len = dim * 4;
+                    let vectors_bytes_len = vectors_len * 4;
+                    let out_bytes_len = count * 4;
+
+                    if query_off.checked_add(query_bytes_len).unwrap_or(usize::MAX) > data.len() {
+                        bail!("query oob");
+                    }
+                    if vectors_off.checked_add(vectors_bytes_len).unwrap_or(usize::MAX) > data.len() {
+                        bail!("vectors oob");
+                    }
+                    let data_mut = mem.data_mut(&mut caller);
+                    if out_off.checked_add(out_bytes_len).unwrap_or(usize::MAX) > data_mut.len() {
+                        bail!("out oob");
+                    }
+
+                    let query: &[f32] = bytemuck::try_cast_slice(&data[query_off..query_off + query_bytes_len])
+                        .map_err(|_| anyhow::anyhow!("unaligned query"))?;
+                    let vectors: &[f32] = bytemuck::try_cast_slice(&data[vectors_off..vectors_off + vectors_bytes_len])
+                        .map_err(|_| anyhow::anyhow!("unaligned vectors"))?;
+                    let out: &mut [f32] = bytemuck::try_cast_slice_mut(&mut data_mut[out_off..out_off + out_bytes_len])
+                        .map_err(|_| anyhow::anyhow!("unaligned out"))?;
+
+                    for i in 0..count {
+                        let base = i * dim;
+                        out[i] = crate::ivf_flat::l2_sq(query, &vectors[base..base + dim]);
+                    }
+                    Ok(1)
+                })();
+                res.unwrap_or(0)
+            },
+        )?;
+
         let wasi = WasiCtxBuilder::new().inherit_stdio().build();
         let mut store = Store::new(
             &engine,
@@ -213,6 +279,9 @@ impl WasmIvfFlatKernel {
         let set_profile_stages = instance
             .get_typed_func::<u32, ()>(&mut store, "ivf_set_profile_stages_ffi")
             .ok();
+        let set_use_host_dist = instance
+            .get_typed_func::<u32, ()>(&mut store, "ivf_set_use_host_dist_ffi")
+            .ok();
         let last_stats = instance
             .get_typed_func::<u32, u32>(&mut store, "ivf_last_stats_ffi")
             .ok();
@@ -228,11 +297,13 @@ impl WasmIvfFlatKernel {
             search_batch,
             set_decoded_cache_budget,
             set_profile_stages,
+            set_use_host_dist,
             last_stats,
             last_stats_v2,
             decoded_cache_budget_bytes: 192 * 1024 * 1024,
             last_kernel_stats: KernelStats::default(),
             profile_stages: false,
+            use_host_dist: false,
         })
     }
 
@@ -242,6 +313,10 @@ impl WasmIvfFlatKernel {
 
     pub fn set_profile_stages(&mut self, enabled: bool) {
         self.profile_stages = enabled;
+    }
+
+    pub fn set_use_host_dist(&mut self, enabled: bool) {
+        self.use_host_dist = enabled;
     }
 
     pub fn kernel_stats(&self) -> KernelStats {
@@ -378,6 +453,9 @@ impl WasmIvfFlatKernel {
         }
         if let Some(setter) = &self.set_profile_stages {
             let _ = setter.call(&mut self.store, if self.profile_stages { 1 } else { 0 });
+        }
+        if let Some(setter) = &self.set_use_host_dist {
+            let _ = setter.call(&mut self.store, if self.use_host_dist { 1 } else { 0 });
         }
 
         let ok = self.search_batch.call(

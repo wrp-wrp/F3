@@ -187,6 +187,12 @@ Stage profiling 表来自 `bash scripts/run_sift_ivf_aligned_profile_strict.sh`�
 | wasm_f16_warm | raw_f16 | host_cache=on + kernel_decoded_cache=on | 14.071 | 0.000 | 0.001 | 0.037 | 0.000 | 12.446 | 1.471 | 13.909 | 0 |
 | wasm_f16_cold | raw_f16 | host_cache=off + kernel_decoded_cache=off | 133.969 | 12.259 | 19.752 | 0.046 | 100.266 | 11.679 | 1.442 | 13.129 | 513 |
 
+#### Hybrid（Wasm 控制流程 + host 距离核）
+
+Wasm 内核支持一个可选的 hybrid 模式：Wasm 负责解码/遍历/策略，距离计算由 host 提供的 SIMD 批量距离核完成（用于验证“计算核是否必须留在 native”）。
+
+跑法：`EXTRA_HOST_DIST=1 bash scripts/run_sift_ivf_aligned_profile_strict.sh`
+
 #### 距离计算核 microbench（native vs Wasm）
 
 Stage profiling 的 `dist_ms` 会受计时埋点影响（尤其是 Wasm 内部 `Instant` 采样），因此补一个“只测距离核吞吐”的 microbench：

@@ -118,6 +118,14 @@ run_case "wasm_f16_warm" --artifact-wasm-kernel "$wasm_kernel" --artifact-postin
 run_case "wasm_f16_cold" --artifact-wasm-kernel "$wasm_kernel" --artifact-posting-codec raw_f16 \
   --artifact-wasm-no-cache --artifact-wasm-decoded-cache-bytes 0
 
+if [[ "${EXTRA_HOST_DIST:-}" == "1" ]]; then
+  # Hybrid: Wasm controls traversal/decode, host computes L2 batch distances.
+  run_case "wasm_f16_warm_hostdist" --artifact-wasm-kernel "$wasm_kernel" --artifact-posting-codec raw_f16 \
+    --artifact-wasm-decoded-cache-bytes 201326592 --artifact-wasm-host-dist
+  run_case "wasm_f16_cold_hostdist" --artifact-wasm-kernel "$wasm_kernel" --artifact-posting-codec raw_f16 \
+    --artifact-wasm-no-cache --artifact-wasm-decoded-cache-bytes 0 --artifact-wasm-host-dist
+fi
+
 echo "[4/4] Summaries"
 python3 "$root/scripts/summarize_ivf_jsonl.py" "$out_dir"
 echo "results: $out_dir"

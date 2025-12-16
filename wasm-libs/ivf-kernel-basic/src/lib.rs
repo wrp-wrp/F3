@@ -453,24 +453,57 @@ fn l2_sq_scalar(a: &[f32], b: &[f32]) -> f32 {
 unsafe fn l2_sq_simd128(a: &[f32], b: &[f32]) -> f32 {
     use core::arch::wasm32::*;
     let n = a.len().min(b.len());
-    let mut acc = f32x4_splat(0.0);
-    let chunks = n / 4;
     let ap = a.as_ptr();
     let bp = b.as_ptr();
-    for i in 0..chunks {
-        let va = v128_load(ap.add(i * 4) as *const v128);
-        let vb = v128_load(bp.add(i * 4) as *const v128);
+    // Unroll to reduce loop overhead and expose ILP (similar to native NEON kernel).
+    let mut acc0 = f32x4_splat(0.0);
+    let mut acc1 = f32x4_splat(0.0);
+    let mut acc2 = f32x4_splat(0.0);
+    let mut acc3 = f32x4_splat(0.0);
+
+    let mut i = 0usize;
+    while i + 16 <= n {
+        let a0 = v128_load(ap.add(i) as *const v128);
+        let b0 = v128_load(bp.add(i) as *const v128);
+        let d0 = f32x4_sub(a0, b0);
+        acc0 = f32x4_add(acc0, f32x4_mul(d0, d0));
+
+        let a1v = v128_load(ap.add(i + 4) as *const v128);
+        let b1v = v128_load(bp.add(i + 4) as *const v128);
+        let d1 = f32x4_sub(a1v, b1v);
+        acc1 = f32x4_add(acc1, f32x4_mul(d1, d1));
+
+        let a2v = v128_load(ap.add(i + 8) as *const v128);
+        let b2v = v128_load(bp.add(i + 8) as *const v128);
+        let d2 = f32x4_sub(a2v, b2v);
+        acc2 = f32x4_add(acc2, f32x4_mul(d2, d2));
+
+        let a3v = v128_load(ap.add(i + 12) as *const v128);
+        let b3v = v128_load(bp.add(i + 12) as *const v128);
+        let d3 = f32x4_sub(a3v, b3v);
+        acc3 = f32x4_add(acc3, f32x4_mul(d3, d3));
+
+        i += 16;
+    }
+
+    let mut acc = f32x4_add(f32x4_add(acc0, acc1), f32x4_add(acc2, acc3));
+    while i + 4 <= n {
+        let va = v128_load(ap.add(i) as *const v128);
+        let vb = v128_load(bp.add(i) as *const v128);
         let d = f32x4_sub(va, vb);
         acc = f32x4_add(acc, f32x4_mul(d, d));
+        i += 4;
     }
+
     // Horizontal add 4 lanes.
     let mut sum = f32x4_extract_lane::<0>(acc)
         + f32x4_extract_lane::<1>(acc)
         + f32x4_extract_lane::<2>(acc)
         + f32x4_extract_lane::<3>(acc);
-    for i in (chunks * 4)..n {
-        let d = a[i] - b[i];
+    while i < n {
+        let d = *ap.add(i) - *bp.add(i);
         sum += d * d;
+        i += 1;
     }
     sum
 }

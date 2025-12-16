@@ -154,22 +154,14 @@ Wasm 的每次迭代 JSON 行现在包含这些字段（来自 `vector_ivf_flat_
 - `native_f16_warm ≈ 28.177ms`，`native_f16_cold ≈ 102.289ms`
 - `wasm_f16_warm ≈ 50.215ms`，`wasm_f16_cold ≈ 158.466ms`
 
-#### 严格对齐 Stage profiling 结果（SIFT100K，nq=32，p50 over iterations）
+#### 严格对齐 Stage profiling（SIFT100K，nq=32）
 
-该表来自 `bash scripts/run_sift_ivf_aligned_profile_strict.sh`（每个 case 都开启 `--profile-stages`），因此 native 侧也会给出 `centroid/decode/dist/heap`，Wasm 侧同时给出 `fetch/transfer/decode/compute`。
+Stage profiling 表来自 `bash scripts/run_sift_ivf_aligned_profile_strict.sh`（每个 case 都开启 `--profile-stages`），因此：
 
-本地结果目录（一次样例）：`results/sift_ivf_aligned_profile_strict_20251216_100338/`
+- native 侧会给出 `centroid/decode/dist/heap/compute`
+- Wasm 侧会给出 `fetch/transfer`（host）+ `centroid/decode/dist/heap/compute`（kernel）
 
-| case | codec | cache | p50_wall_ms | p50_fetch_ms | p50_transfer_ms | p50_centroid_ms | p50_decode_ms | p50_dist_ms | p50_heap_ms | p50_compute_ms | chunks_fetched |
-|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| native_f32_warm | raw | posting_cache=on | 28.524 | - | - | 0.068 | 0.000 | 27.726 | 0.689 | 28.477 | - |
-| native_f32_cold | raw | posting_cache=off | 68.309 | - | - | 0.076 | 38.278 | 27.594 | 0.692 | 67.961 | - |
-| wasm_f32_warm | raw | host_cache=on | 59.398 | 0.000 | 8.057 | 0.113 | 0.000 | 49.686 | 1.298 | 50.991 | 0 |
-| wasm_f32_cold | raw | host_cache=off | 94.478 | 28.441 | 43.714 | 0.116 | 0.000 | 49.243 | 1.302 | 50.552 | 513 |
-| native_f16_warm | raw_f16 | posting_cache=on | 28.905 | - | - | 0.069 | 0.000 | 28.092 | 0.693 | 28.859 | - |
-| native_f16_cold | raw_f16 | posting_cache=off | 105.222 | - | - | 0.078 | 75.084 | 29.380 | 0.736 | 104.896 | - |
-| wasm_f16_warm | raw_f16 | host_cache=on + kernel_decoded_cache=on | 51.424 | 0.000 | 0.001 | 0.115 | 0.000 | 49.876 | 1.330 | 51.188 | 0 |
-| wasm_f16_cold | raw_f16 | host_cache=off + kernel_decoded_cache=off | 166.178 | 12.699 | 19.919 | 0.117 | 92.994 | 50.702 | 1.365 | 52.083 | 513 |
+为了让表格有参考价值，下面只保留 *SIMD 严格对齐* 的最新一组（见下节，目录：`results/sift_ivf_aligned_profile_strict_20251216_121958/`）。
 
 #### 严格对齐 Stage profiling（Wasm `simd128` / native SIMD）
 

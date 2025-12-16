@@ -30,9 +30,14 @@ WASM_RUSTFLAGS="${WASM_RUSTFLAGS:-}"
 if [[ -n "$WASM_RUSTFLAGS" ]]; then
   echo "WASM_RUSTFLAGS=$WASM_RUSTFLAGS"
 fi
+jobs_flag=()
+if [[ -n "${CARGO_BUILD_JOBS:-}" ]]; then
+  echo "CARGO_BUILD_JOBS=$CARGO_BUILD_JOBS"
+  jobs_flag=(--jobs "$CARGO_BUILD_JOBS")
+fi
 wasm_target_dir="${WASM_TARGET_DIR:-$root/target_profile_strict_wasm}"
 RUSTFLAGS="$WASM_RUSTFLAGS" CARGO_TARGET_DIR="$wasm_target_dir" \
-  cargo build -p ivf-kernel-basic --target wasm32-wasip1 --release
+  cargo build -p ivf-kernel-basic --target wasm32-wasip1 --release "${jobs_flag[@]}"
 wasm_kernel="$wasm_target_dir/wasm32-wasip1/release/ivf_kernel_basic.wasm"
 
 echo "[3/4] Run strict stage-profile matrix -> $out_dir"
@@ -45,12 +50,13 @@ cat >"$out_dir/build_config.txt" <<EOF
 NATIVE_RUSTFLAGS=$NATIVE_RUSTFLAGS
 WASM_RUSTFLAGS=$WASM_RUSTFLAGS
 WASM_TARGET_DIR=$wasm_target_dir
+CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-}
 EOF
 
 echo "[3a/4] Build native runner"
 native_target_dir="${NATIVE_TARGET_DIR:-$root/target_profile_strict_native}"
 RUSTFLAGS="$NATIVE_RUSTFLAGS" CARGO_TARGET_DIR="$native_target_dir" \
-  cargo build -p fff-bench --release --example vector_ivf_flat_demo
+  cargo build -p fff-bench --release --example vector_ivf_flat_demo "${jobs_flag[@]}"
 native_bin="$native_target_dir/release/examples/vector_ivf_flat_demo"
 if [[ ! -x "$native_bin" ]]; then
   echo "native runner not found: $native_bin" >&2

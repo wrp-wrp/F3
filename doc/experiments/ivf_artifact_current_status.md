@@ -212,8 +212,8 @@ CARGO_TARGET_DIR=/tmp/f3_native_strict cargo build -p fff-bench --release --exam
 
 | 对齐组 | native ns/op (median) | wasm ns/op (median) | ratio (wasm/native) |
 |---|---:|---:|---:|
-| scalar ↔ scalar（`--native-scalar` / wasm no-simd） | 30.125 | 46.700 | 1.552 |
-| simd ↔ simd（native 默认 / wasm `simd128`） | 16.891 | 9.919 | 0.573 |
+| scalar ↔ scalar（`--native-scalar` / wasm no-simd） | 30.618 | 47.245 | 1.541 |
+| simd ↔ simd（native 默认 / wasm `simd128`） | 6.721 | 9.805 | 1.458 |
 
 
 ### Size 拆分（同一份 index 文件）

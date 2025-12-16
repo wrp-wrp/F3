@@ -336,22 +336,51 @@ unsafe fn l2_sq_neon(a: &[f32], b: &[f32]) -> f32 {
     use core::arch::aarch64::*;
 
     let n = a.len().min(b.len());
-    let mut acc = vdupq_n_f32(0.0);
-    let mut i = 0usize;
-
     let ap = a.as_ptr();
     let bp = b.as_ptr();
+
+    // Unroll to reduce loop overhead and expose ILP.
+    let mut acc0 = vdupq_n_f32(0.0);
+    let mut acc1 = vdupq_n_f32(0.0);
+    let mut acc2 = vdupq_n_f32(0.0);
+    let mut acc3 = vdupq_n_f32(0.0);
+    let mut i = 0usize;
+
+    while i + 16 <= n {
+        let a0 = vld1q_f32(ap.add(i));
+        let b0 = vld1q_f32(bp.add(i));
+        let d0 = vsubq_f32(a0, b0);
+        acc0 = vfmaq_f32(acc0, d0, d0);
+
+        let a1v = vld1q_f32(ap.add(i + 4));
+        let b1v = vld1q_f32(bp.add(i + 4));
+        let d1 = vsubq_f32(a1v, b1v);
+        acc1 = vfmaq_f32(acc1, d1, d1);
+
+        let a2v = vld1q_f32(ap.add(i + 8));
+        let b2v = vld1q_f32(bp.add(i + 8));
+        let d2 = vsubq_f32(a2v, b2v);
+        acc2 = vfmaq_f32(acc2, d2, d2);
+
+        let a3v = vld1q_f32(ap.add(i + 12));
+        let b3v = vld1q_f32(bp.add(i + 12));
+        let d3 = vsubq_f32(a3v, b3v);
+        acc3 = vfmaq_f32(acc3, d3, d3);
+
+        i += 16;
+    }
+
+    let mut acc = vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3));
     while i + 4 <= n {
         let va = vld1q_f32(ap.add(i));
         let vb = vld1q_f32(bp.add(i));
         let d = vsubq_f32(va, vb);
-        acc = vmlaq_f32(acc, d, d);
+        acc = vfmaq_f32(acc, d, d);
         i += 4;
     }
 
-    let mut lanes = [0.0f32; 4];
-    vst1q_f32(lanes.as_mut_ptr(), acc);
-    let mut sum = lanes[0] + lanes[1] + lanes[2] + lanes[3];
+    // Horizontal sum: single instruction on AArch64.
+    let mut sum = vaddvq_f32(acc);
     while i < n {
         let d = *ap.add(i) - *bp.add(i);
         sum += d * d;

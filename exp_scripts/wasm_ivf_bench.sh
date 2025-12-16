@@ -5,9 +5,9 @@ PROJECT_ROOT=$(git rev-parse --show-toplevel)
 cd "$PROJECT_ROOT"
 
 # Build WASM Kernel
-echo "Building WASM Kernel..."
+echo "Building WASM Kernel (with SIMD)..."
 cd wasm-libs/ivf-kernel-basic
-cargo build --target wasm32-wasip1 --release
+RUSTFLAGS="-C target-feature=+simd128" cargo build --target wasm32-wasip1 --release
 cd "$PROJECT_ROOT"
 
 # Build Tools

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use fff_vindex::ivf_flat::l2_sq;
+use fff_vindex::ivf_flat::l2_microbench_query_vs_vectors_f32;
 use serde_json::json;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -29,6 +29,10 @@ struct Args {
     #[arg(long, default_value_t = 2)]
     warmup: usize,
 
+    /// Force native scalar baseline (for scalar↔scalar alignment).
+    #[arg(long, default_value_t = false)]
+    native_scalar: bool,
+
     /// Print JSON.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     json: bool,
@@ -48,7 +52,15 @@ fn main() -> Result<()> {
     let (wasm_ctx, wasm_query_ptr, wasm_vectors_ptr, wasm_out_ptr) =
         prepare_wasm(&args.wasm, &query, &vectors)?;
 
-    let native = measure_native(&query, &vectors, count, dim, iters, args.warmup);
+    let native = measure_native(
+        &query,
+        &vectors,
+        count,
+        dim,
+        iters,
+        args.warmup,
+        !args.native_scalar,
+    );
     let wasm = measure_wasm(
         wasm_ctx,
         wasm_query_ptr,
@@ -75,6 +87,7 @@ fn main() -> Result<()> {
                     "elapsed_ns": native.elapsed_ns,
                     "ns_per_op": native_ns_per_op,
                     "checksum": native.checksum,
+                    "use_simd": !args.native_scalar,
                 },
                 "wasm": {
                     "elapsed_ns": wasm.elapsed_ns,
@@ -116,27 +129,22 @@ struct Timed {
     checksum: f32,
 }
 
-fn measure_native(query: &[f32], vectors: &[f32], count: usize, dim: usize, iters: usize, warmup: usize) -> Timed {
+fn measure_native(
+    query: &[f32],
+    vectors: &[f32],
+    count: usize,
+    dim: usize,
+    iters: usize,
+    warmup: usize,
+    use_simd: bool,
+) -> Timed {
     for _ in 0..warmup {
-        let _ = native_loop(query, vectors, count, dim, iters / 10 + 1);
+        let _ = l2_microbench_query_vs_vectors_f32(query, vectors, count, dim, iters / 10 + 1, use_simd);
     }
     let start = Instant::now();
-    let checksum = native_loop(query, vectors, count, dim, iters);
+    let checksum = l2_microbench_query_vs_vectors_f32(query, vectors, count, dim, iters, use_simd);
     let elapsed_ns = start.elapsed().as_nanos() as u64;
     Timed { elapsed_ns, checksum }
-}
-
-#[inline(never)]
-fn native_loop(query: &[f32], vectors: &[f32], count: usize, dim: usize, iters: usize) -> f32 {
-    let mut acc = 0.0f32;
-    for _ in 0..iters {
-        for i in 0..count {
-            let base = i * dim;
-            let v = &vectors[base..base + dim];
-            acc += l2_sq(query, v);
-        }
-    }
-    std::hint::black_box(acc)
 }
 
 struct WasmCtx {

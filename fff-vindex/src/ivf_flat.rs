@@ -277,6 +277,13 @@ pub fn l2_sq(a: &[f32], b: &[f32]) -> f32 {
     l2_sq_scalar(a, b)
 }
 
+/// Scalar-only L2 squared distance, useful for fair microbench baselines.
+#[inline]
+pub fn l2_sq_scalar_only(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    l2_sq_scalar(a, b)
+}
+
 #[inline]
 fn l2_sq_scalar(a: &[f32], b: &[f32]) -> f32 {
     let n = a.len().min(b.len());
@@ -286,6 +293,40 @@ fn l2_sq_scalar(a: &[f32], b: &[f32]) -> f32 {
         sum += d * d;
     }
     sum
+}
+
+/// Native microbenchmark helper for the distance kernel, aligned with the Wasm microbench export.
+///
+/// Computes `iters * count` distances between:
+/// - `query`: a single `f32[dim]`
+/// - `vectors`: `f32[count * dim]` (row-major, contiguous)
+///
+/// When `use_simd=true`, uses `l2_sq()`; otherwise forces scalar.
+#[inline(never)]
+pub fn l2_microbench_query_vs_vectors_f32(
+    query: &[f32],
+    vectors: &[f32],
+    count: usize,
+    dim: usize,
+    iters: usize,
+    use_simd: bool,
+) -> f32 {
+    debug_assert_eq!(query.len(), dim);
+    debug_assert_eq!(vectors.len(), count.saturating_mul(dim));
+
+    let mut acc = 0.0f32;
+    for _ in 0..iters {
+        for i in 0..count {
+            let base = i * dim;
+            let v = &vectors[base..base + dim];
+            acc += if use_simd {
+                l2_sq(query, v)
+            } else {
+                l2_sq_scalar_only(query, v)
+            };
+        }
+    }
+    std::hint::black_box(acc)
 }
 
 #[cfg(target_arch = "aarch64")]

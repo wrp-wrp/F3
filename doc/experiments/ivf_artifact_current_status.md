@@ -204,14 +204,16 @@ RUSTFLAGS='-C target-feature=+simd128' CARGO_TARGET_DIR=/tmp/mb_wasm_simd cargo 
 # build + run microbench (native)
 CARGO_TARGET_DIR=/tmp/f3_native_strict cargo build -p fff-bench --release --example l2_kernel_microbench
 /tmp/f3_native_strict/release/examples/l2_kernel_microbench --wasm /tmp/mb_wasm_simd/wasm32-wasip1/release/ivf_kernel_basic.wasm
+# scalar↔scalar 对齐（native 强制 scalar；Wasm 也不编译 simd128）
+/tmp/f3_native_strict/release/examples/l2_kernel_microbench --native-scalar --wasm /tmp/mb_wasm_nosimd/wasm32-wasip1/release/ivf_kernel_basic.wasm
 ```
 
-本机一次样例（`dim=128, count=16384, iters=200`，各跑 5 次取 median，checksum 对齐）：
+本机一次样例（`dim=128, count=8192, iters=1000, warmup=3`，各跑 7 次取 median，checksum 对齐）：
 
-| wasm build | native ns/op (median) | wasm ns/op (median) | ratio (wasm/native) |
+| 对齐组 | native ns/op (median) | wasm ns/op (median) | ratio (wasm/native) |
 |---|---:|---:|---:|
-| no simd | 16.939 | 46.593 | 2.742 |
-| simd128 | 16.867 | 9.665 | 0.572 |
+| scalar ↔ scalar（`--native-scalar` / wasm no-simd） | 30.125 | 46.700 | 1.552 |
+| simd ↔ simd（native 默认 / wasm `simd128`） | 16.891 | 9.919 | 0.573 |
 
 
 ### Size 拆分（同一份 index 文件）

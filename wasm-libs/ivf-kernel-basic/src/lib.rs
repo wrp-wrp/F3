@@ -1,5 +1,6 @@
 use ordered_float::NotNan;
 use std::alloc::{alloc, dealloc, Layout};
+use core::arch::wasm32::*;
 use std::cmp::Ordering;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
@@ -693,20 +694,19 @@ pub unsafe extern "C" fn ivf_flat_search_ffi(
 
         match posting_codec {
             0 => {
-                // raw: [count:u32][row_ids:u32*count][vectors]
                 let row_ids_bytes = 4 + count * 4;
                 if bytes.len() != row_ids_bytes + vectors_bytes_f32 {
                     continue;
                 }
-                let row_ids: &[u32] = std::slice::from_raw_parts(
-                    bytes[4..row_ids_bytes].as_ptr() as *const u32,
-                    count,
-                );
                 let vectors: &[f32] = std::slice::from_raw_parts(
                     bytes[row_ids_bytes..].as_ptr() as *const f32,
                     count * dim as usize,
                 );
-                for (pos, &row_id) in row_ids.iter().enumerate() {
+                for (pos, _) in (0..count).enumerate() {
+                    let mut row_id_buf = [0u8; 4];
+                    row_id_buf.copy_from_slice(&bytes[4 + pos * 4..4 + pos * 4 + 4]);
+                    let row_id = u32::from_le_bytes(row_id_buf);
+
                     let v = &vectors[pos * dim as usize..(pos + 1) * dim as usize];
                     heap_push_topk(&mut heap, k, row_id, l2_sq(query, v));
                 }
@@ -752,17 +752,16 @@ pub unsafe extern "C" fn ivf_flat_search_ffi(
                 }
             }
             2 => {
-                // raw_f16: [count:u32][row_ids:u32*count][vectors:f16]
                 let row_ids_bytes = 4 + count * 4;
                 if bytes.len() != row_ids_bytes + vectors_bytes_f16 {
                     continue;
                 }
-                let row_ids: &[u32] = std::slice::from_raw_parts(
-                    bytes[4..row_ids_bytes].as_ptr() as *const u32,
-                    count,
-                );
                 let vectors_bytes = &bytes[row_ids_bytes..];
-                for (pos, &row_id) in row_ids.iter().enumerate() {
+                for (pos, _) in (0..count).enumerate() {
+                    let mut row_id_buf = [0u8; 4];
+                    row_id_buf.copy_from_slice(&bytes[4 + pos * 4..4 + pos * 4 + 4]);
+                    let row_id = u32::from_le_bytes(row_id_buf);
+
                     let off = pos * dim as usize * 2;
                     let v = &vectors_bytes[off..off + dim as usize * 2];
                     heap_push_topk(&mut heap, k, row_id, l2_sq_f16(query, v));
@@ -804,6 +803,84 @@ pub unsafe extern "C" fn ivf_flat_search_ffi(
                     let off = pos * dim as usize * 2;
                     let v = &vectors_bytes[off..off + dim as usize * 2];
                     heap_push_topk(&mut heap, k, cur_row, l2_sq_f16(query, v));
+                }
+            }
+            4 => {
+                // RawU8: [count:u32][scale:f32][zero_point:f32][row_ids:u32*count][vectors:u8]
+                let row_ids_bytes = 12 + count * 4;
+                let vectors_bytes_u8 = count * dim as usize;
+                
+                if bytes.len() != row_ids_bytes + vectors_bytes_u8 {
+                    continue;
+                }
+                let scale = f32::from_le_bytes(bytes[4..8].try_into().unwrap());
+                let zero_point = f32::from_le_bytes(bytes[8..12].try_into().unwrap());
+
+                let q_vectors = &bytes[row_ids_bytes..];
+
+                // Dequantize on the fly
+                for (pos, _) in (0..count).enumerate() {
+                    let mut row_id_buf = [0u8; 4];
+                    row_id_buf.copy_from_slice(&bytes[12 + pos * 4..12 + pos * 4 + 4]);
+                    let row_id = u32::from_le_bytes(row_id_buf);
+
+                    let base = pos * dim as usize;
+                    let q_vec = &q_vectors[base..base + dim as usize];
+                    // Simple scalar dequant loop.
+                    let mut sum = 0.0f32;
+                    for j in 0..dim as usize {
+                        let val = (q_vec[j] as f32 - zero_point) / scale;
+                        let d = query[j] - val;
+                        sum += d * d;
+                    }
+                    heap_push_topk(&mut heap, k, row_id, sum);
+                }
+            }
+            5 => {
+                // RowIdDeltaVarintV1U8: [count:u32][scale:f32][zero_point:f32][first:u32][deltas...][vectors:u8]
+                if bytes.len() < 16 {
+                    continue;
+                }
+                let scale = f32::from_le_bytes(bytes[4..8].try_into().unwrap());
+                let zero_point = f32::from_le_bytes(bytes[8..12].try_into().unwrap());
+
+                let mut offset = 16usize;
+                if count > 1 {
+                    for _ in 1..count {
+                        let Some((_, used)) = decode_uleb128_u32(&bytes[offset..]) else {
+                            offset = usize::MAX;
+                            break;
+                        };
+                        offset += used;
+                    }
+                }
+                let vectors_bytes_u8 = count * dim as usize;
+                if offset == usize::MAX || bytes.len() != offset + vectors_bytes_u8 {
+                    continue;
+                }
+                let q_vectors = &bytes[offset..];
+
+                let mut cur_row = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+                let mut off2 = 16usize;
+
+                for pos in 0..count {
+                    if pos > 0 {
+                        let Some((delta, used)) = decode_uleb128_u32(&bytes[off2..]) else {
+                            break;
+                        };
+                        off2 += used;
+                        cur_row = cur_row.wrapping_add(delta);
+                    }
+                    let base = pos * dim as usize;
+                    let q_vec = &q_vectors[base..base + dim as usize];
+                    // Simple scalar dequant loop.
+                    let mut sum = 0.0f32;
+                    for j in 0..dim as usize {
+                        let val = (q_vec[j] as f32 - zero_point) / scale;
+                        let d = query[j] - val;
+                        sum += d * d;
+                    }
+                    heap_push_topk(&mut heap, k, cur_row, sum);
                 }
             }
             _ => continue,
@@ -849,11 +926,25 @@ pub unsafe extern "C" fn ivf_flat_search_batch_ffi(
     if dir_dim != dim || nlist == 0 {
         return 0;
     }
-    let needed = 16usize + (nlist as usize) * 4;
-    if dir.len() < needed {
-        return 0;
+    
+    let mut codebooks_chunk_id = 0;
+    let posting_ids_bytes;
+    
+    if posting_codec == 6 {
+        // IvfPq: Extra u32 for codebooks_chunk_id
+        if dir.len() < 20 { return 0; }
+        codebooks_chunk_id = read_u32_le(dir, 16).unwrap();
+        let needed = 20usize + (nlist as usize) * 4;
+        if dir.len() < needed { return 0; }
+        posting_ids_bytes = &dir[20..20 + (nlist as usize) * 4];
+    } else {
+        let needed = 16usize + (nlist as usize) * 4;
+        if dir.len() < needed {
+            return 0;
+        }
+        posting_ids_bytes = &dir[16..16 + (nlist as usize) * 4];
     }
-    let posting_ids_bytes = &dir[16..16 + (nlist as usize) * 4];
+
     let posting_chunk_ids: &[u32] = std::slice::from_raw_parts(
         posting_ids_bytes.as_ptr() as *const u32,
         nlist as usize,
@@ -921,6 +1012,149 @@ pub unsafe extern "C" fn ivf_flat_search_batch_ffi(
             // For f16 codecs, cache decoded postings to avoid repeated dynamic decoding.
             if posting_codec == 2 || posting_codec == 3 {
                 if let Some(posting) = decoded_cache().lock().unwrap().get(posting_chunk_id) {
+                    // ... (cache logic for F16/U8 is handled by generic code below for now?)
+                    // Actually existing logic handles 2/3 specifically.
+                    // For PQ (6), we don't cache locally in kernel memory yet?
+                    // We can reuse the same cache if we store `Arc<Posting>`.
+                    // But `Posting` struct is different.
+                    // For now, no kernel-side caching for PQ. Host handles caching raw bytes.
+                }
+            }
+
+            let start_decode = if profile { Some(Instant::now()) } else { None };
+            let posting_bytes = match fetch_chunk(posting_chunk_id) {
+                Some(b) => b,
+                None => continue,
+            };
+
+            // Logic dispatch based on codec
+            if posting_codec == 6 {
+                // IvfPq Search
+                // 1. Load Codebooks (lazy load if not present?)
+                // We should load codebooks once outside loop.
+                // But loop is over lists.
+                // Codebooks are global.
+                // We can cache them in a static? Or just load every time (host cache makes it fast).
+                // Let's load inside loop but cache it? No, load once per batch call is better.
+                // BUT `codebooks_chunk_id` was read outside.
+                // Let's defer loading to first use or load before q loop.
+                // Re-fetch from host is cheap (Arc copy).
+                // Parsing codebooks is cheap (cast to slice).
+                // But parsing needs to happen.
+                // Codebooks layout: raw flat f32.
+                // We need to know `m` and `d_sub`.
+                // `m` = codes_len / count? No.
+                // `dim` is given.
+                // `d_sub` = dim / m.
+                // We don't know `m` explicitly from dir?
+                // We must infer `m` from Codebooks size?
+                // Codebooks size = m * 256 * d_sub * 4.
+                // m * 256 * (dim / m) * 4 = 256 * dim * 4.
+                // So size is constant regardless of `m`!
+                // Wait. `256 * dim * 4` bytes.
+                // So we cannot infer `m`.
+                // We need `m`.
+                // `ChunkDesc` or `Footer` has `num_subspaces`.
+                // Kernel doesn't see Footer.
+                // Kernel assumes `m`. Typically `m` is part of configuration or encoded in posting list?
+                // Posting list has `count`, then `row_ids`.
+                // Then `codes`. `codes.len() = count * m`.
+                // So `m = codes.len() / count`.
+                // We can infer `m` from the posting list!
+                // Iterate over `centroid_dists`:
+                
+                let codebooks_bytes = match fetch_chunk(codebooks_chunk_id) {
+                    Some(b) => b,
+                    None => continue,
+                };
+                let codebooks: &[f32] = bytemuck::cast_slice(&codebooks_bytes);
+                // Validation? 
+                
+                // Parse Posting List
+                let bytes = &posting_bytes;
+                if bytes.len() < 4 { continue; }
+                let count = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+                if count == 0 { continue; }
+                
+                // Decode Row IDs
+                let mut row_ids = Vec::with_capacity(count);
+                let first_row_id = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+                let mut codes_offset = 8;
+                row_ids.push(first_row_id);
+                
+                let mut cur = first_row_id;
+                for _ in 1..count {
+                     if let Some((delta, used)) = decode_uleb128_u32(&bytes[codes_offset..]) {
+                         codes_offset += used;
+                         cur = cur.wrapping_add(delta);
+                         row_ids.push(cur);
+                     } else {
+                         break;
+                     }
+                }
+                
+                if row_ids.len() != count { continue; }
+                
+                let codes = &bytes[codes_offset..];
+                if codes.len() % count != 0 { continue; }
+                let m = codes.len() / count;
+                let d_sub = dim as usize / m;
+                
+                if codebooks.len() != 256 * dim as usize {
+                     // Error or continue
+                     continue; 
+                }
+                
+                // Precompute LUT for this (Query - Centroid)
+                // Centroid C is corresponding to `cid`.
+                // We already have `cid`.
+                let centroid_vec = &centroids[(*cid as usize) * (dim as usize)..((*cid as usize)+1) * (dim as usize)];
+                
+                // q_res = query - centroid
+                // We can compute LUT directly without explicit q_res allocation.
+                // LUT[sub][code] = || (q[sub] - C[sub]) - Codebook[sub][code] ||^2
+                //                = || q[sub] - (C[sub] + Codebook[sub][code]) ||^2
+                
+                let mut lut = vec![0.0f32; m * 256];
+                for sub in 0..m {
+                     let q_sub_start = sub * d_sub;
+                     let q_sub = &query[q_sub_start..q_sub_start + d_sub];
+                     let c_sub = &centroid_vec[q_sub_start..q_sub_start + d_sub];
+                     
+                     // Subspace codebook start
+                     // Codebooks stored as: [sub0_c0, sub0_c1 ... sub0_c255, sub1_c0 ...]
+                     // i.e. Blocked by subspace.
+                     // (Verified by `train_pq_codebooks` pushing centroids sequentially per subspace)
+                     let cb_sub_start = sub * 256 * d_sub;
+                     
+                     for code in 0..256 {
+                         let cb_vec = &codebooks[cb_sub_start + code * d_sub .. cb_sub_start + (code+1) * d_sub];
+                         let mut d2 = 0.0f32;
+                         for k in 0..d_sub {
+                             let diff = q_sub[k] - (c_sub[k] + cb_vec[k]);
+                             d2 += diff * diff;
+                         }
+                         lut[sub * 256 + code] = d2;
+                     }
+                }
+                
+                // Scan codes
+                for i in 0..count {
+                    let mut dist = 0.0f32;
+                    let vec_codes = &codes[i * m .. (i+1) * m];
+                    for sub in 0..m {
+                        let code = vec_codes[sub] as usize;
+                        dist += lut[sub * 256 + code];
+                    }
+                    heap_push_topk(&mut heap, k, row_ids[i], dist);
+                }
+                
+                continue;
+            }
+
+            // Existing logic for other codecs...
+            if posting_codec == 2 || posting_codec == 3 {
+                if let Some(posting) = decoded_cache().lock().unwrap().get(posting_chunk_id) {
                     decoded_cache_hits += 1;
                     if profile {
                         scratch_dists.clear();
@@ -944,6 +1178,7 @@ pub unsafe extern "C" fn ivf_flat_search_batch_ffi(
                     }
                     continue;
                 }
+                
                 decoded_cache_misses += 1;
                 let bytes = match fetch_chunk(posting_chunk_id) {
                     Some(b) => b,
@@ -998,36 +1233,38 @@ pub unsafe extern "C" fn ivf_flat_search_batch_ffi(
                     if bytes.len() != row_ids_bytes + vectors_bytes_f32 {
                         continue;
                     }
-                    let row_ids: &[u32] = std::slice::from_raw_parts(
-                        bytes[4..row_ids_bytes].as_ptr() as *const u32,
-                        count,
-                    );
                     let vectors: &[f32] = std::slice::from_raw_parts(
                         bytes[row_ids_bytes..].as_ptr() as *const f32,
                         count * dim as usize,
                     );
                     if profile {
                         scratch_dists.clear();
-                        scratch_dists.reserve(row_ids.len());
+                        scratch_dists.reserve(count);
                         let start_dist = Instant::now();
-                        for pos in 0..row_ids.len() {
+                        for pos in 0..count {
                             let v = &vectors[pos * dim as usize..(pos + 1) * dim as usize];
                             scratch_dists.push(l2_sq(query, v));
                         }
                         dist_ns += start_dist.elapsed().as_nanos() as u64;
 
                         let start_heap = Instant::now();
-                        for (pos, &row_id) in row_ids.iter().enumerate() {
+                        for (pos, _) in (0..count).enumerate() {
+                            let mut row_id_buf = [0u8; 4];
+                            row_id_buf.copy_from_slice(&bytes[4 + pos * 4..4 + pos * 4 + 4]);
+                            let row_id = u32::from_le_bytes(row_id_buf);
                             heap_push_topk(&mut heap, k, row_id, scratch_dists[pos]);
                         }
                         heap_ns += start_heap.elapsed().as_nanos() as u64;
                     } else {
-                        let start_compute = Instant::now();
-                        for (pos, &row_id) in row_ids.iter().enumerate() {
+                        for (pos, _) in (0..count).enumerate() {
+                            let mut row_id_buf = [0u8; 4];
+                            row_id_buf.copy_from_slice(&bytes[4 + pos * 4..4 + pos * 4 + 4]);
+                            let row_id = u32::from_le_bytes(row_id_buf);
+
                             let v = &vectors[pos * dim as usize..(pos + 1) * dim as usize];
                             heap_push_topk(&mut heap, k, row_id, l2_sq(query, v));
                         }
-                        compute_ns += start_compute.elapsed().as_nanos() as u64;
+                        // compute_ns += start_compute.elapsed().as_nanos() as u64; -- removed Instant::now
                     }
                 }
                 1 => {
@@ -1104,22 +1341,34 @@ pub unsafe extern "C" fn ivf_flat_search_batch_ffi(
                         }
                         compute_ns += start_compute.elapsed().as_nanos() as u64;
                     }
+                    }
+                4 => {
+                    // RawU8: [count:u32][scale:f32][zero_point:f32][row_ids:u32*count][vectors:u8]
+                    process_raw_u8(
+                        &bytes,
+                        count,
+                        dim as usize,
+                        &query,
+                        k as usize,
+                        &mut heap,
+                        profile,
+                        &mut scratch_dists,
+                        &mut dist_ns,
+                        &mut heap_ns,
+                        &mut compute_ns,
+                    );
                 }
                 2 => {
                     let row_ids_bytes = 4 + count * 4;
                     if bytes.len() != row_ids_bytes + vectors_bytes_f16 {
                         continue;
                     }
-                    let row_ids: &[u32] = std::slice::from_raw_parts(
-                        bytes[4..row_ids_bytes].as_ptr() as *const u32,
-                        count,
-                    );
                     let vectors_bytes = &bytes[row_ids_bytes..];
                     if profile {
                         scratch_dists.clear();
-                        scratch_dists.reserve(row_ids.len());
+                        scratch_dists.reserve(count);
                         let start_dist = Instant::now();
-                        for pos in 0..row_ids.len() {
+                        for pos in 0..count {
                             let off = pos * dim as usize * 2;
                             let v = &vectors_bytes[off..off + dim as usize * 2];
                             scratch_dists.push(l2_sq_f16(query, v));
@@ -1127,18 +1376,24 @@ pub unsafe extern "C" fn ivf_flat_search_batch_ffi(
                         dist_ns += start_dist.elapsed().as_nanos() as u64;
 
                         let start_heap = Instant::now();
-                        for (pos, &row_id) in row_ids.iter().enumerate() {
+                        for (pos, _) in (0..count).enumerate() {
+                            let mut row_id_buf = [0u8; 4];
+                            row_id_buf.copy_from_slice(&bytes[4 + pos * 4..4 + pos * 4 + 4]);
+                            let row_id = u32::from_le_bytes(row_id_buf);
                             heap_push_topk(&mut heap, k, row_id, scratch_dists[pos]);
                         }
                         heap_ns += start_heap.elapsed().as_nanos() as u64;
                     } else {
-                        let start_compute = Instant::now();
-                        for (pos, &row_id) in row_ids.iter().enumerate() {
+                        for (pos, _) in (0..count).enumerate() {
+                            let mut row_id_buf = [0u8; 4];
+                            row_id_buf.copy_from_slice(&bytes[4 + pos * 4..4 + pos * 4 + 4]);
+                            let row_id = u32::from_le_bytes(row_id_buf);
+
                             let off = pos * dim as usize * 2;
                             let v = &vectors_bytes[off..off + dim as usize * 2];
                             heap_push_topk(&mut heap, k, row_id, l2_sq_f16(query, v));
                         }
-                        compute_ns += start_compute.elapsed().as_nanos() as u64;
+                        // compute_ns += start_compute.elapsed().as_nanos() as u64;
                     }
                 }
                 3 => {
@@ -1237,4 +1492,239 @@ pub unsafe extern "C" fn ivf_flat_search_batch_ffi(
     };
 
     1
+}
+
+#[inline(always)]
+fn process_raw_u8(
+    bytes: &[u8],
+    count: usize,
+    dim: usize,
+    query: &[f32],
+    k: usize,
+    mut heap: &mut std::collections::BinaryHeap<Pair>,
+    profile: bool,
+    scratch_dists: &mut Vec<f32>,
+    dist_ns: &mut u64,
+    heap_ns: &mut u64,
+    compute_ns: &mut u64,
+) {
+    let row_ids_bytes = 12 + count * 4;
+    let vectors_bytes_u8 = count * dim as usize;
+    if bytes.len() != row_ids_bytes + vectors_bytes_u8 {
+        return;
+    }
+    let scale = f32::from_le_bytes(bytes[4..8].try_into().unwrap());
+    let zero_point = f32::from_le_bytes(bytes[8..12].try_into().unwrap());
+    let vectors_bytes = &bytes[row_ids_bytes..];
+
+    // Precompute Transform Phase 0: T = S*q + Z, C = Sum(T^2)
+    let mut transformed_query = vec![0.0f32; dim];
+    let mut sum_t_sq = 0.0f32;
+    for i in 0..dim {
+        let t = scale * query[i] + zero_point;
+        transformed_query[i] = t;
+        sum_t_sq += t * t;
+    }
+    let inv_scale_sq = 1.0 / (scale * scale);
+
+    if profile {
+        scratch_dists.clear();
+        scratch_dists.reserve(count);
+        // let start_dist = Instant::now();
+        for pos in 0..count {
+            let off = pos * dim as usize;
+            let q_vec = &vectors_bytes[off..off + dim as usize];
+            
+            // SIMD Optimization
+            let dist = unsafe { l2_sq_u8_simd_fast(&transformed_query, q_vec, dim, inv_scale_sq, sum_t_sq) };
+            scratch_dists.push(dist);
+        }
+        // *dist_ns += start_dist.elapsed().as_nanos() as u64;
+
+        // let start_heap = Instant::now();
+        for (pos, _) in (0..count).enumerate() {
+            let mut row_id_buf = [0u8; 4];
+            row_id_buf.copy_from_slice(&bytes[12 + pos * 4..12 + pos * 4 + 4]);
+            let row_id = u32::from_le_bytes(row_id_buf);
+            heap_push_topk(&mut heap, k, row_id, scratch_dists[pos]);
+        }
+        // *heap_ns += start_heap.elapsed().as_nanos() as u64;
+    } else {
+        // let start_compute = Instant::now();
+        for (pos, _) in (0..count).enumerate() {
+            let mut row_id_buf = [0u8; 4];
+            row_id_buf.copy_from_slice(&bytes[12 + pos * 4..12 + pos * 4 + 4]);
+            let row_id = u32::from_le_bytes(row_id_buf);
+
+            let off = pos * dim as usize;
+            let q_vec = &vectors_bytes[off..off + dim as usize];
+            
+            // SIMD Optimization
+            let dist = unsafe { l2_sq_u8_simd_fast(&transformed_query, q_vec, dim, inv_scale_sq, sum_t_sq) };
+            heap_push_topk(&mut heap, k, row_id, dist);
+        }
+        // *compute_ns += start_compute.elapsed().as_nanos() as u64;
+    }
+}
+
+#[target_feature(enable = "simd128")]
+unsafe fn l2_sq_u8_simd_fast(
+    transformed_query: &[f32], // T = S*q + Z
+    vector: &[u8],
+    dim: usize,
+    inv_scale_sq: f32, // 1/S^2
+    sum_t_sq: f32,     // Sum(T^2)
+) -> f32 {
+    let mut i = 0;
+    
+    let mut sum_r_sq_i32_0 = i32x4_splat(0);
+    let mut sum_r_sq_i32_1 = i32x4_splat(0);
+    let mut sum_r_sq_i32_2 = i32x4_splat(0);
+    let mut sum_r_sq_i32_3 = i32x4_splat(0);
+
+    let mut sum_tr_0 = f32x4_splat(0.0);
+    let mut sum_tr_1 = f32x4_splat(0.0);
+    let mut sum_tr_2 = f32x4_splat(0.0);
+    let mut sum_tr_3 = f32x4_splat(0.0);
+
+    let v_ptr = vector.as_ptr();
+    let t_ptr = transformed_query.as_ptr();
+
+    while i + 64 <= dim {
+        // Block 0
+        {
+            let v_u8 = v128_load(v_ptr.add(i) as *const v128);
+            let v_lo_16 = i16x8_extend_low_u8x16(v_u8);
+            let v_hi_16 = i16x8_extend_high_u8x16(v_u8);
+            let sq_lo = i32x4_dot_i16x8(v_lo_16, v_lo_16);
+            let sq_hi = i32x4_dot_i16x8(v_hi_16, v_hi_16);
+            sum_r_sq_i32_0 = i32x4_add(sum_r_sq_i32_0, i32x4_add(sq_lo, sq_hi));
+
+            let v_f0 = f32x4_convert_i32x4(i32x4_extend_low_i16x8(v_lo_16));
+            let v_f1 = f32x4_convert_i32x4(i32x4_extend_high_i16x8(v_lo_16));
+            let v_f2 = f32x4_convert_i32x4(i32x4_extend_low_i16x8(v_hi_16));
+            let v_f3 = f32x4_convert_i32x4(i32x4_extend_high_i16x8(v_hi_16));
+
+            let t0 = v128_load(t_ptr.add(i) as *const v128);
+            let t1 = v128_load(t_ptr.add(i+4) as *const v128);
+            let t2 = v128_load(t_ptr.add(i+8) as *const v128);
+            let t3 = v128_load(t_ptr.add(i+12) as *const v128);
+
+            sum_tr_0 = f32x4_add(sum_tr_0, f32x4_mul(t0, v_f0));
+            sum_tr_0 = f32x4_add(sum_tr_0, f32x4_mul(t1, v_f1));
+            sum_tr_0 = f32x4_add(sum_tr_0, f32x4_mul(t2, v_f2));
+            sum_tr_0 = f32x4_add(sum_tr_0, f32x4_mul(t3, v_f3));
+        }
+
+        // Block 1
+        {
+            let v_u8 = v128_load(v_ptr.add(i+16) as *const v128);
+            let v_lo_16 = i16x8_extend_low_u8x16(v_u8);
+            let v_hi_16 = i16x8_extend_high_u8x16(v_u8);
+            let sq_lo = i32x4_dot_i16x8(v_lo_16, v_lo_16);
+            let sq_hi = i32x4_dot_i16x8(v_hi_16, v_hi_16);
+            sum_r_sq_i32_1 = i32x4_add(sum_r_sq_i32_1, i32x4_add(sq_lo, sq_hi));
+
+            let v_f0 = f32x4_convert_i32x4(i32x4_extend_low_i16x8(v_lo_16));
+            let v_f1 = f32x4_convert_i32x4(i32x4_extend_high_i16x8(v_lo_16));
+            let v_f2 = f32x4_convert_i32x4(i32x4_extend_low_i16x8(v_hi_16));
+            let v_f3 = f32x4_convert_i32x4(i32x4_extend_high_i16x8(v_hi_16));
+
+            let t0 = v128_load(t_ptr.add(i+16) as *const v128);
+            let t1 = v128_load(t_ptr.add(i+20) as *const v128);
+            let t2 = v128_load(t_ptr.add(i+24) as *const v128);
+            let t3 = v128_load(t_ptr.add(i+28) as *const v128);
+
+            sum_tr_1 = f32x4_add(sum_tr_1, f32x4_mul(t0, v_f0));
+            sum_tr_1 = f32x4_add(sum_tr_1, f32x4_mul(t1, v_f1));
+            sum_tr_1 = f32x4_add(sum_tr_1, f32x4_mul(t2, v_f2));
+            sum_tr_1 = f32x4_add(sum_tr_1, f32x4_mul(t3, v_f3));
+        }
+
+        // Block 2
+        {
+            let v_u8 = v128_load(v_ptr.add(i+32) as *const v128);
+            let v_lo_16 = i16x8_extend_low_u8x16(v_u8);
+            let v_hi_16 = i16x8_extend_high_u8x16(v_u8);
+            let sq_lo = i32x4_dot_i16x8(v_lo_16, v_lo_16);
+            let sq_hi = i32x4_dot_i16x8(v_hi_16, v_hi_16);
+            sum_r_sq_i32_2 = i32x4_add(sum_r_sq_i32_2, i32x4_add(sq_lo, sq_hi));
+
+            let v_f0 = f32x4_convert_i32x4(i32x4_extend_low_i16x8(v_lo_16));
+            let v_f1 = f32x4_convert_i32x4(i32x4_extend_high_i16x8(v_lo_16));
+            let v_f2 = f32x4_convert_i32x4(i32x4_extend_low_i16x8(v_hi_16));
+            let v_f3 = f32x4_convert_i32x4(i32x4_extend_high_i16x8(v_hi_16));
+
+            let t0 = v128_load(t_ptr.add(i+32) as *const v128);
+            let t1 = v128_load(t_ptr.add(i+36) as *const v128);
+            let t2 = v128_load(t_ptr.add(i+40) as *const v128);
+            let t3 = v128_load(t_ptr.add(i+44) as *const v128);
+
+            sum_tr_2 = f32x4_add(sum_tr_2, f32x4_mul(t0, v_f0));
+            sum_tr_2 = f32x4_add(sum_tr_2, f32x4_mul(t1, v_f1));
+            sum_tr_2 = f32x4_add(sum_tr_2, f32x4_mul(t2, v_f2));
+            sum_tr_2 = f32x4_add(sum_tr_2, f32x4_mul(t3, v_f3));
+        }
+
+        // Block 3
+        {
+            let v_u8 = v128_load(v_ptr.add(i+48) as *const v128);
+            let v_lo_16 = i16x8_extend_low_u8x16(v_u8);
+            let v_hi_16 = i16x8_extend_high_u8x16(v_u8);
+            let sq_lo = i32x4_dot_i16x8(v_lo_16, v_lo_16);
+            let sq_hi = i32x4_dot_i16x8(v_hi_16, v_hi_16);
+            sum_r_sq_i32_3 = i32x4_add(sum_r_sq_i32_3, i32x4_add(sq_lo, sq_hi));
+
+            let v_f0 = f32x4_convert_i32x4(i32x4_extend_low_i16x8(v_lo_16));
+            let v_f1 = f32x4_convert_i32x4(i32x4_extend_high_i16x8(v_lo_16));
+            let v_f2 = f32x4_convert_i32x4(i32x4_extend_low_i16x8(v_hi_16));
+            let v_f3 = f32x4_convert_i32x4(i32x4_extend_high_i16x8(v_hi_16));
+
+            let t0 = v128_load(t_ptr.add(i+48) as *const v128);
+            let t1 = v128_load(t_ptr.add(i+52) as *const v128);
+            let t2 = v128_load(t_ptr.add(i+56) as *const v128);
+            let t3 = v128_load(t_ptr.add(i+60) as *const v128);
+
+            sum_tr_3 = f32x4_add(sum_tr_3, f32x4_mul(t0, v_f0));
+            sum_tr_3 = f32x4_add(sum_tr_3, f32x4_mul(t1, v_f1));
+            sum_tr_3 = f32x4_add(sum_tr_3, f32x4_mul(t2, v_f2));
+            sum_tr_3 = f32x4_add(sum_tr_3, f32x4_mul(t3, v_f3));
+        }
+
+        i += 64;
+    }
+
+    // Reduce accumulators
+    let sum_r_sq_i32 = i32x4_add(i32x4_add(sum_r_sq_i32_0, sum_r_sq_i32_1), i32x4_add(sum_r_sq_i32_2, sum_r_sq_i32_3));
+    let sum_tr = f32x4_add(f32x4_add(sum_tr_0, sum_tr_1), f32x4_add(sum_tr_2, sum_tr_3));
+
+
+    // Reduction
+    // Sum(r^2)
+    let r_sq_sum = (i32x4_extract_lane::<0>(sum_r_sq_i32) as f32) +
+                   (i32x4_extract_lane::<1>(sum_r_sq_i32) as f32) +
+                   (i32x4_extract_lane::<2>(sum_r_sq_i32) as f32) +
+                   (i32x4_extract_lane::<3>(sum_r_sq_i32) as f32);
+    
+    // Sum(T*r)
+    let tr_sum = f32x4_extract_lane::<0>(sum_tr) +
+                 f32x4_extract_lane::<1>(sum_tr) +
+                 f32x4_extract_lane::<2>(sum_tr) +
+                 f32x4_extract_lane::<3>(sum_tr);
+
+    let mut final_r_sq = r_sq_sum;
+    let mut final_tr = tr_sum;
+
+    // Tail
+    while i < dim {
+        let r_val = *v_ptr.add(i) as f32;
+        let t_val = *t_ptr.add(i);
+        final_r_sq += r_val * r_val;
+        final_tr += t_val * r_val;
+        i += 1;
+    }
+
+    // Dist = (1/S^2) * (Sum(T^2) - 2*Sum(T*r) + Sum(r^2))
+    // Dist = (1/S^2) * (C - 2B + A)
+    (sum_t_sq - 2.0 * final_tr + final_r_sq) * inv_scale_sq
 }

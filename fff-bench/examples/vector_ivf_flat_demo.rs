@@ -126,6 +126,8 @@ fn main() -> Result<()> {
             "row_id_delta_varint_v1" => PostingCodec::RowIdDeltaVarintV1,
             "raw_f16" => PostingCodec::RawF16,
             "row_id_delta_varint_v1_f16" => PostingCodec::RowIdDeltaVarintV1F16,
+            "raw_u8" => PostingCodec::RawU8,
+            "row_id_delta_varint_v1_u8" => PostingCodec::RowIdDeltaVarintV1U8,
             other => return Err(anyhow!("unsupported --artifact-posting-codec: {other}")),
         };
         let index_path = build_ivf_flat_artifact_with_options(
@@ -252,6 +254,8 @@ fn main() -> Result<()> {
             "row_id_delta_varint_v1" => PostingCodec::RowIdDeltaVarintV1,
             "raw_f16" => PostingCodec::RawF16,
             "row_id_delta_varint_v1_f16" => PostingCodec::RowIdDeltaVarintV1F16,
+            "raw_u8" => PostingCodec::RawU8,
+            "row_id_delta_varint_v1_u8" => PostingCodec::RowIdDeltaVarintV1U8,
             other => return Err(anyhow!("unsupported --artifact-posting-codec: {other}")),
         };
         let index_path = build_ivf_flat_artifact_with_options(

@@ -4284,6 +4284,7 @@ dependencies = [
 name = "ivf-kernel-basic"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "ordered-float 4.6.0",
 ]
 

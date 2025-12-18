@@ -32,7 +32,7 @@ fi
 codecs=("raw" "row_id_delta_varint_v1" "raw_f16" "row_id_delta_varint_v1_f16")
 
 # Run Benchmark for each codec
-echo "mode,nq,nprobe,avg_latency_ms,chunks_fetched,decoded_cache_hits,decode_time_ms,compute_time_ms,codec" > "$BASE_DIR/all_bench_results.csv"
+echo "mode,nq,nprobe,avg_latency_ms,chunks_fetched,decoded_cache_hits,decode_time_ms,compute_time_ms,host_copy_time_ms,codec" > "$BASE_DIR/all_bench_results.csv"
 
 for codec in "${codecs[@]}"; do
     echo "Running Benchmark for codec: $codec"

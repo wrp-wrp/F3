@@ -5,6 +5,8 @@ target_profile_strict_*/
 /target_aligned_*/
 /target_aligned_profile_*/
 /target_aligned_profile_strict_*/
+target_rq1_*/
+/target_p0_matrix_wasm/
 
 .vscode
 *.log

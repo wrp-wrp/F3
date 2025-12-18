@@ -348,6 +348,86 @@ fn decode_row_ids_raw(bytes: &[u8], count: usize) -> Option<Vec<u32>> {
     Some(out)
 }
 
+fn decode_vectors_f32(bytes: &[u8], count: usize, dim: usize) -> Option<Vec<f32>> {
+    let bytes_len = count.checked_mul(dim)?.checked_mul(4)?;
+    if bytes.len() < bytes_len {
+        return None;
+    }
+    let mut out = Vec::<f32>::with_capacity(count * dim);
+    let mut off = 0usize;
+    for _ in 0..(count * dim) {
+        let b = bytes.get(off..off + 4)?;
+        out.push(f32::from_le_bytes(b.try_into().ok()?));
+        off += 4;
+    }
+    Some(out)
+}
+
+fn decode_posting_raw_f32(bytes: &[u8], dim: usize) -> Option<DecodedPosting> {
+    if bytes.len() < 4 {
+        return None;
+    }
+    let count = u32::from_le_bytes(bytes[0..4].try_into().ok()?) as usize;
+    let row_ids_bytes = 4 + count * 4;
+    let vectors_bytes = count * dim * 4;
+    if bytes.len() != row_ids_bytes + vectors_bytes {
+        return None;
+    }
+    let row_ids = decode_row_ids_raw(&bytes[4..row_ids_bytes], count)?;
+    let vectors = decode_vectors_f32(&bytes[row_ids_bytes..], count, dim)?;
+    let mem_bytes = row_ids.len() * 4 + vectors.len() * 4;
+    Some(DecodedPosting {
+        row_ids,
+        vectors,
+        bytes: mem_bytes,
+    })
+}
+
+fn decode_posting_delta_f32(bytes: &[u8], dim: usize) -> Option<DecodedPosting> {
+    if bytes.len() < 8 {
+        return None;
+    }
+    let count = u32::from_le_bytes(bytes[0..4].try_into().ok()?) as usize;
+    let mut cur_row = u32::from_le_bytes(bytes[4..8].try_into().ok()?);
+    let mut offset = 8usize;
+    let mut row_ids = Vec::<u32>::with_capacity(count);
+    if count > 0 {
+        row_ids.push(cur_row);
+        for _ in 1..count {
+            let (delta, used) = decode_uleb128_u32(&bytes[offset..])?;
+            offset += used;
+            cur_row = cur_row.wrapping_add(delta);
+            row_ids.push(cur_row);
+        }
+    }
+    let vectors_bytes = count * dim * 4;
+    if bytes.len() != offset + vectors_bytes {
+        return None;
+    }
+    let vectors = decode_vectors_f32(&bytes[offset..], count, dim)?;
+    let mem_bytes = row_ids.len() * 4 + vectors.len() * 4;
+    Some(DecodedPosting {
+        row_ids,
+        vectors,
+        bytes: mem_bytes,
+    })
+}
+
+#[inline]
+fn posting_codec_uses_decoded_cache(posting_codec: u32) -> bool {
+    matches!(posting_codec, 0 | 1 | 2 | 3)
+}
+
+fn decode_posting_to_f32(bytes: &[u8], posting_codec: u32, dim: usize) -> Option<DecodedPosting> {
+    match posting_codec {
+        0 => decode_posting_raw_f32(bytes, dim),
+        1 => decode_posting_delta_f32(bytes, dim),
+        2 => decode_posting_raw_f16(bytes, dim),
+        3 => decode_posting_delta_f16(bytes, dim),
+        _ => None,
+    }
+}
+
 fn decode_vectors_f16_to_f32(bytes: &[u8], count: usize, dim: usize) -> Option<Vec<f32>> {
     if bytes.len() < count * dim * 2 {
         return None;
@@ -1003,36 +1083,22 @@ pub unsafe extern "C" fn ivf_flat_search_batch_ffi(
 
         let mut heap = std::collections::BinaryHeap::<Pair>::new();
 
-        for (cid, _) in &centroid_dists {
-            let posting_chunk_id = posting_chunk_ids.get(*cid as usize).copied().unwrap_or(0);
-            if posting_chunk_id == 0 {
-                continue;
-            }
+	        for (cid, _) in &centroid_dists {
+	            let posting_chunk_id = posting_chunk_ids.get(*cid as usize).copied().unwrap_or(0);
+	            if posting_chunk_id == 0 {
+	                continue;
+	            }
 
-            // For f16 codecs, cache decoded postings to avoid repeated dynamic decoding.
-            if posting_codec == 2 || posting_codec == 3 {
-                if let Some(posting) = decoded_cache().lock().unwrap().get(posting_chunk_id) {
-                    // ... (cache logic for F16/U8 is handled by generic code below for now?)
-                    // Actually existing logic handles 2/3 specifically.
-                    // For PQ (6), we don't cache locally in kernel memory yet?
-                    // We can reuse the same cache if we store `Arc<Posting>`.
-                    // But `Posting` struct is different.
-                    // For now, no kernel-side caching for PQ. Host handles caching raw bytes.
-                }
-            }
-
-            let start_decode = if profile { Some(Instant::now()) } else { None };
-            let posting_bytes = match fetch_chunk(posting_chunk_id) {
-                Some(b) => b,
-                None => continue,
-            };
-
-            // Logic dispatch based on codec
-            if posting_codec == 6 {
-                // IvfPq Search
-                // 1. Load Codebooks (lazy load if not present?)
-                // We should load codebooks once outside loop.
-                // But loop is over lists.
+	            // Logic dispatch based on codec
+	            if posting_codec == 6 {
+	                let posting_bytes = match fetch_chunk(posting_chunk_id) {
+	                    Some(b) => b,
+	                    None => continue,
+	                };
+	                // IvfPq Search
+	                // 1. Load Codebooks (lazy load if not present?)
+	                // We should load codebooks once outside loop.
+	                // But loop is over lists.
                 // Codebooks are global.
                 // We can cache them in a static? Or just load every time (host cache makes it fast).
                 // Let's load inside loop but cache it? No, load once per batch call is better.
@@ -1070,11 +1136,11 @@ pub unsafe extern "C" fn ivf_flat_search_batch_ffi(
                 let codebooks: &[f32] = bytemuck::cast_slice(&codebooks_bytes);
                 // Validation? 
                 
-                // Parse Posting List
-                let bytes = &posting_bytes;
-                if bytes.len() < 4 { continue; }
-                let count = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
-                if count == 0 { continue; }
+	                // Parse Posting List
+	                let bytes = &posting_bytes;
+	                if bytes.len() < 4 { continue; }
+	                let count = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+	                if count == 0 { continue; }
                 
                 // Decode Row IDs
                 let mut row_ids = Vec::with_capacity(count);
@@ -1152,8 +1218,9 @@ pub unsafe extern "C" fn ivf_flat_search_batch_ffi(
                 continue;
             }
 
-            // Existing logic for other codecs...
-            if posting_codec == 2 || posting_codec == 3 {
+            // Cache decoded postings inside Wasm to avoid repeated host->wasm copies for hot chunks.
+            // This is critical for RQ1: boundary/copy should be amortizable in steady state.
+            if posting_codec_uses_decoded_cache(posting_codec) {
                 if let Some(posting) = decoded_cache().lock().unwrap().get(posting_chunk_id) {
                     decoded_cache_hits += 1;
                     if profile {
@@ -1185,11 +1252,7 @@ pub unsafe extern "C" fn ivf_flat_search_batch_ffi(
                     None => continue,
                 };
                 let start_decode = Instant::now();
-                let decoded = match posting_codec {
-                    2 => decode_posting_raw_f16(&bytes, dim as usize),
-                    3 => decode_posting_delta_f16(&bytes, dim as usize),
-                    _ => None,
-                };
+                let decoded = decode_posting_to_f32(&bytes, posting_codec, dim as usize);
                 decode_ns += start_decode.elapsed().as_nanos() as u64;
                 let Some(decoded) = decoded else { continue; };
                 if profile {

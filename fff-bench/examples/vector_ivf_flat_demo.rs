@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Context, Result};
+use arrow_array::Array;
 use arrow_array::cast::AsArray;
 use arrow_array::FixedSizeListArray;
 use clap::Parser;
@@ -9,7 +10,7 @@ use fff_vindex::artifact::ivf_flat::{
 };
 use fff_vindex::artifact::wasm_ivf_flat::WasmIvfFlatKernel;
 use fff_vindex::ivf_flat::{
-    build_ivf_flat_sidecar, load_ivf_flat_index, search_ivf_flat, IvfFlatBuildOptions,
+    build_ivf_flat_sidecar, load_ivf_flat_index, search_ivf_flat, IvfFlatBuildOptions, SearchResult,
 };
 use serde_json::json;
 use std::fs::File;
@@ -106,12 +107,30 @@ struct Args {
     /// Do not print the top-k results (only print stats).
     #[arg(long, default_value_t = false)]
     quiet: bool,
+
+    /// Compute recall@k via brute-force scan over base vectors (can be expensive).
+    #[arg(long, default_value_t = false)]
+    recall: bool,
+
+    /// Number of queries used for recall computation (defaults to min(nq, 10)).
+    #[arg(long)]
+    recall_queries: Option<usize>,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
 
     let queries = read_first_vectors(&args.base_f3, args.vector_leaf_index, args.dim, args.nq)?;
+    let recall_queries = args.recall_queries.unwrap_or(args.nq.min(10));
+    let all_vectors = if args.recall {
+        Some(read_all_vectors(
+            &args.base_f3,
+            args.vector_leaf_index,
+            args.dim,
+        )?)
+    } else {
+        None
+    };
 
     let build_opts = IvfFlatBuildOptions {
         nlist: args.nlist,
@@ -120,7 +139,7 @@ fn main() -> Result<()> {
         max_kmeans_iters: args.max_kmeans_iters,
     };
 
-    let (index_path, results) = if let Some(wasm_path) = &args.artifact_wasm_kernel {
+    let (index_path, results_batch) = if let Some(wasm_path) = &args.artifact_wasm_kernel {
         let posting_codec = match args.artifact_posting_codec.as_str() {
             "raw" => PostingCodec::Raw,
             "row_id_delta_varint_v1" => PostingCodec::RowIdDeltaVarintV1,
@@ -146,6 +165,14 @@ fn main() -> Result<()> {
                 json!({
                     "event": "meta",
                     "engine": "wasm",
+                    "base_f3": args.base_f3.to_string_lossy(),
+                    "vector_leaf_index": args.vector_leaf_index,
+                    "dim": args.dim,
+                    "index_name": args.index_name,
+                    "nlist": args.nlist,
+                    "train_sample": args.train_sample,
+                    "seed": args.seed,
+                    "max_kmeans_iters": args.max_kmeans_iters,
                     "index_path": index_path.to_string_lossy(),
                     "index_bytes": index_bytes,
                     "nq": args.nq,
@@ -183,7 +210,7 @@ fn main() -> Result<()> {
         }
 
         // Measure
-        let mut last_results = Vec::new();
+        let mut last_results_batch: Vec<Vec<SearchResult>> = Vec::new();
         for it in 0..args.repeat {
             kernel.reset_stats();
             let run_start = Instant::now();
@@ -201,6 +228,14 @@ fn main() -> Result<()> {
                     json!({
                         "engine": "wasm",
                         "iteration": it,
+                        "base_f3": args.base_f3.to_string_lossy(),
+                        "vector_leaf_index": args.vector_leaf_index,
+                        "dim": args.dim,
+                        "index_name": args.index_name,
+                        "nlist": args.nlist,
+                        "train_sample": args.train_sample,
+                        "seed": args.seed,
+                        "max_kmeans_iters": args.max_kmeans_iters,
                         "nq": nq,
                         "k": args.k,
                         "nprobe": args.nprobe,
@@ -244,10 +279,10 @@ fn main() -> Result<()> {
                     stats.raw_bytes_decoded,
                 );
             }
-            last_results = results_batch.into_iter().next().unwrap_or_default();
+            last_results_batch = results_batch;
         }
 
-        (index_path, last_results)
+        (index_path, last_results_batch)
     } else if args.artifact {
         let posting_codec = match args.artifact_posting_codec.as_str() {
             "raw" => PostingCodec::Raw,
@@ -274,6 +309,14 @@ fn main() -> Result<()> {
                 json!({
                     "event": "meta",
                     "engine": "native_artifact",
+                    "base_f3": args.base_f3.to_string_lossy(),
+                    "vector_leaf_index": args.vector_leaf_index,
+                    "dim": args.dim,
+                    "index_name": args.index_name,
+                    "nlist": args.nlist,
+                    "train_sample": args.train_sample,
+                    "seed": args.seed,
+                    "max_kmeans_iters": args.max_kmeans_iters,
                     "index_path": index_path.to_string_lossy(),
                     "index_bytes": index_bytes,
                     "nq": args.nq,
@@ -300,6 +343,7 @@ fn main() -> Result<()> {
             }
         }
         let mut last = Vec::new();
+        let mut last_results_batch: Vec<Vec<SearchResult>> = Vec::new();
         for it in 0..args.repeat {
             if args.artifact_native_clear_each_iter {
                 searcher.clear_posting_cache();
@@ -311,11 +355,16 @@ fn main() -> Result<()> {
             let mut heap_ns: u64 = 0;
             let mut cache_hits: u64 = 0;
             let mut cache_misses: u64 = 0;
+            let mut iter_results_batch: Vec<Vec<SearchResult>> = Vec::new();
             for q in 0..args.nq {
                 let query = &queries[q * args.dim..(q + 1) * args.dim];
                 if args.profile_stages {
                     let (r, s) = searcher.search_profiled(query, args.k, args.nprobe)?;
-                    last = r;
+                    if args.recall {
+                        iter_results_batch.push(r);
+                    } else {
+                        last = r;
+                    }
                     centroid_ns += s.centroid_ns;
                     decode_ns += s.posting_decode_ns;
                     dist_ns += s.dist_ns;
@@ -323,7 +372,12 @@ fn main() -> Result<()> {
                     cache_hits += s.posting_cache_hits;
                     cache_misses += s.posting_cache_misses;
                 } else {
-                    last = searcher.search(query, args.k, args.nprobe)?;
+                    let r = searcher.search(query, args.k, args.nprobe)?;
+                    if args.recall {
+                        iter_results_batch.push(r);
+                    } else {
+                        last = r;
+                    }
                 }
             }
             let wall_ms = run_start.elapsed().as_secs_f64() * 1000.0;
@@ -337,6 +391,14 @@ fn main() -> Result<()> {
                     json!({
                         "engine": "native_artifact",
                         "iteration": it,
+                        "base_f3": args.base_f3.to_string_lossy(),
+                        "vector_leaf_index": args.vector_leaf_index,
+                        "dim": args.dim,
+                        "index_name": args.index_name,
+                        "nlist": args.nlist,
+                        "train_sample": args.train_sample,
+                        "seed": args.seed,
+                        "max_kmeans_iters": args.max_kmeans_iters,
                         "nq": args.nq,
                         "k": args.k,
                         "nprobe": args.nprobe,
@@ -355,8 +417,15 @@ fn main() -> Result<()> {
             } else {
                 println!("native_artifact it={} wall_ms={:.3}", it, wall_ms);
             }
+            if args.recall {
+                last_results_batch = iter_results_batch;
+            }
         }
-        (index_path, last)
+        if args.recall {
+            (index_path, last_results_batch)
+        } else {
+            (index_path, vec![last])
+        }
     } else {
         let index_path = build_ivf_flat_sidecar(
             &args.base_f3,
@@ -373,6 +442,14 @@ fn main() -> Result<()> {
                 json!({
                     "event": "meta",
                     "engine": "native_sidecar",
+                    "base_f3": args.base_f3.to_string_lossy(),
+                    "vector_leaf_index": args.vector_leaf_index,
+                    "dim": args.dim,
+                    "index_name": args.index_name,
+                    "nlist": args.nlist,
+                    "train_sample": args.train_sample,
+                    "seed": args.seed,
+                    "max_kmeans_iters": args.max_kmeans_iters,
                     "index_path": index_path.to_string_lossy(),
                     "index_bytes": index_bytes,
                     "nq": args.nq,
@@ -389,11 +466,18 @@ fn main() -> Result<()> {
             }
         }
         let mut last = Vec::new();
+        let mut last_results_batch: Vec<Vec<SearchResult>> = Vec::new();
         for it in 0..args.repeat {
             let run_start = Instant::now();
+            let mut iter_results_batch: Vec<Vec<SearchResult>> = Vec::new();
             for q in 0..args.nq {
                 let query = &queries[q * args.dim..(q + 1) * args.dim];
-                last = search_ivf_flat(&index, query, args.k, args.nprobe)?;
+                let r = search_ivf_flat(&index, query, args.k, args.nprobe)?;
+                if args.recall {
+                    iter_results_batch.push(r);
+                } else {
+                    last = r;
+                }
             }
             let wall_ms = run_start.elapsed().as_secs_f64() * 1000.0;
             if args.json {
@@ -402,6 +486,14 @@ fn main() -> Result<()> {
                     json!({
                         "engine": "native_sidecar",
                         "iteration": it,
+                        "base_f3": args.base_f3.to_string_lossy(),
+                        "vector_leaf_index": args.vector_leaf_index,
+                        "dim": args.dim,
+                        "index_name": args.index_name,
+                        "nlist": args.nlist,
+                        "train_sample": args.train_sample,
+                        "seed": args.seed,
+                        "max_kmeans_iters": args.max_kmeans_iters,
                         "nq": args.nq,
                         "k": args.k,
                         "nprobe": args.nprobe,
@@ -411,14 +503,61 @@ fn main() -> Result<()> {
             } else {
                 println!("native_sidecar it={} wall_ms={:.3}", it, wall_ms);
             }
+            if args.recall {
+                last_results_batch = iter_results_batch;
+            }
         }
-        (index_path, last)
+        if args.recall {
+            (index_path, last_results_batch)
+        } else {
+            (index_path, vec![last])
+        }
     };
+
+    if args.recall {
+        let Some(all_vectors) = &all_vectors else {
+            return Err(anyhow!("internal: recall enabled but base vectors not loaded"));
+        };
+        if results_batch.len() < recall_queries {
+            return Err(anyhow!(
+                "not enough results for recall: have {} queries, need {}",
+                results_batch.len(),
+                recall_queries
+            ));
+        }
+        let recall = compute_recall_at_k(
+            &results_batch,
+            all_vectors,
+            args.dim,
+            &queries,
+            args.k,
+            recall_queries,
+        );
+        if args.json {
+            println!(
+                "{}",
+                json!({
+                    "event": "recall",
+                    "nq": args.nq,
+                    "recall_queries": recall_queries,
+                    "k": args.k,
+                    "nprobe": args.nprobe,
+                    "posting_codec": args.artifact_posting_codec,
+                    "recall_at_k": recall,
+                    "base_rows": all_vectors.len() / args.dim,
+                    "dim": args.dim,
+                })
+            );
+        } else {
+            println!("recall@{} over {} queries: {:.4}", args.k, recall_queries, recall);
+        }
+    }
 
     if !args.quiet {
         println!("index: {}", index_path.display());
-        println!("top{} (nprobe={}):", results.len(), args.nprobe);
-        for r in results {
+        let display = results_batch.first().cloned().unwrap_or_default();
+        println!("top{} (nprobe={}):", display.len(), args.nprobe);
+        for r in display {
             println!("row_id={} dist={}", r.row_id, r.distance);
         }
     }
@@ -476,4 +615,140 @@ fn read_first_vectors(base_f3: &PathBuf, leaf: usize, dim: usize, nq: usize) -> 
         ));
     }
     Ok(values.values()[..total].to_vec())
+}
+
+fn read_all_vectors(base_f3: &PathBuf, leaf: usize, dim: usize) -> Result<Vec<f32>> {
+    let file = File::open(base_f3).with_context(|| format!("open {}", base_f3.display()))?;
+    let mut reader = FileReaderV2Builder::new(Arc::new(file))
+        .with_projections(Projection::All)
+        .with_selection(Selection::All)
+        .build()
+        .map_err(|e| anyhow!(e.to_string()))?;
+    let batches = reader
+        .read_file()
+        .map_err(|e| anyhow!(e.to_string()))
+        .with_context(|| "read all vectors")?;
+    let mut out = Vec::<f32>::new();
+    for batch in batches {
+        if leaf >= batch.num_columns() {
+            return Err(anyhow!(
+                "vector_leaf_index out of range: {} >= {}",
+                leaf,
+                batch.num_columns()
+            ));
+        }
+        let col = batch.column(leaf);
+        let fsl = col
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .ok_or_else(|| anyhow!("projected column is not FixedSizeListArray"))?;
+        if fsl.value_length() as usize != dim {
+            return Err(anyhow!(
+                "dim mismatch: expected {}, got {}",
+                dim,
+                fsl.value_length()
+            ));
+        }
+        if fsl.null_count() != 0 {
+            return Err(anyhow!("vector column contains nulls"));
+        }
+        let values = fsl.values().as_primitive::<arrow::datatypes::Float32Type>();
+        out.extend_from_slice(values.values());
+    }
+    if dim == 0 || out.len() % dim != 0 {
+        return Err(anyhow!(
+            "vector values len {} not divisible by dim {}",
+            out.len(),
+            dim
+        ));
+    }
+    Ok(out)
+}
+
+fn l2_sq(a: &[f32], b: &[f32]) -> f32 {
+    let n = a.len().min(b.len());
+    let mut sum = 0.0f32;
+    for i in 0..n {
+        let d = a[i] - b[i];
+        sum += d * d;
+    }
+    sum
+}
+
+#[derive(Copy, Clone)]
+struct DistRow {
+    dist: f32,
+    row_id: u32,
+}
+
+impl Eq for DistRow {}
+
+impl PartialEq for DistRow {
+    fn eq(&self, other: &Self) -> bool {
+        self.dist.total_cmp(&other.dist) == std::cmp::Ordering::Equal && self.row_id == other.row_id
+    }
+}
+
+impl Ord for DistRow {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.dist
+            .total_cmp(&other.dist)
+            .then_with(|| self.row_id.cmp(&other.row_id))
+    }
+}
+
+impl PartialOrd for DistRow {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn exact_topk_row_ids(vectors: &[f32], dim: usize, query: &[f32], k: usize) -> Vec<u32> {
+    let dim = dim.max(1);
+    let n = vectors.len() / dim;
+    let mut heap = std::collections::BinaryHeap::<DistRow>::new();
+    for i in 0..n {
+        let base = i * dim;
+        let v = &vectors[base..base + dim];
+        let d = l2_sq(query, v);
+        if heap.len() < k {
+            heap.push(DistRow {
+                dist: d,
+                row_id: i as u32,
+            });
+        } else if let Some(worst) = heap.peek().copied() {
+            if d < worst.dist {
+                let _ = heap.pop();
+                heap.push(DistRow {
+                    dist: d,
+                    row_id: i as u32,
+                });
+            }
+        }
+    }
+    let mut out: Vec<DistRow> = heap.into_iter().collect();
+    out.sort_by(|a, b| a.dist.total_cmp(&b.dist));
+    out.into_iter().map(|x| x.row_id).collect()
+}
+
+fn compute_recall_at_k(
+    approx: &[Vec<SearchResult>],
+    base_vectors: &[f32],
+    dim: usize,
+    queries: &[f32],
+    k: usize,
+    recall_queries: usize,
+) -> f32 {
+    let mut total = 0.0f32;
+    let rq = recall_queries.min(approx.len());
+    for qi in 0..rq {
+        let query = &queries[qi * dim..(qi + 1) * dim];
+        let gt = exact_topk_row_ids(base_vectors, dim, query, k);
+        let gt_set: std::collections::HashSet<u32> = gt.into_iter().collect();
+        let approx_set: std::collections::HashSet<u32> =
+            approx[qi].iter().map(|r| r.row_id).collect();
+        let hit = gt_set.intersection(&approx_set).count();
+        total += (hit as f32) / (k as f32);
+    }
+    total / (rq as f32)
 }

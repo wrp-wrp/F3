@@ -94,3 +94,17 @@ Normalized table (per codec × mode):
 Related write-ups:
 - `doc/experiments/ivf_wasm_benchmark_results.md`
 - `doc/experiments/ivf_artifact_current_status.md` (includes SIFT100K end-to-end tables, stage profiling, and microbench notes)
+
+## 3) IO On-Demand Performance (New Proof)
+
+Measured via `exp_scripts/io_on_demand_benchmark.sh` (2025-12-18).
+
+| Metric | Traditional (Full Load) | F3 (On-Demand WASM) |
+| :--- | :--- | :--- |
+| **Data Fetched** | 25.41 MB (100%) | **0.98 MB (4%)** |
+| **First Query Latency** | 22.92 ms | **1.26 ms (18x faster)** |
+| **Steady State Latency** | 0.44 ms | 0.44 ms |
+
+### 3.1) Storage Breakdown (1M Vectors)
+- **IVF-Flat**: Structure < 1%, Data > 99%.
+- **HNSW (M=32)**: Structure ~25%.

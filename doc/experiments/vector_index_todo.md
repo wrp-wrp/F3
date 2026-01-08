@@ -104,7 +104,8 @@ RQ1 的目标不是“证明 Wasm 很快”，而是给出**可复现、可解�
 ### P0（最高优先级）：把“研究结论链”补齐
 
 - [x] 把 Recall@k 纳入 `vector_ivf_flat_demo` 的输出（native/wasm 都可跑），复用 brute-force/ground truth 逻辑（`fff-bench/examples/vector_ivf_flat_demo.rs` 支持 `--recall [--recall-queries N]`）。
-- [x] 固化一个“最小实验矩阵”（codec × cache × nq × nprobe）并产出可比较的表格：`exp_scripts/p0_min_matrix.sh` + `scripts/summarize_p0_min_matrix.py`。
+- [x] 统一 Wasm kernel 的解码逻辑，支持所有 Flat codec 的统一分发、Profile 与缓存逻辑。
+- [ ] 固化一个“最小实验矩阵”（codec × cache × nq × nprobe）并产出可比较的表格：`exp_scripts/p0_min_matrix.sh` + `scripts/summarize_p0_min_matrix.py`。
 - [x] 修复/统一 `results/ivf_wasm_bench/all_bench_results.csv` 的字段（`exp_scripts/wasm_ivf_bench.sh` 的 header 已与行列对齐）。
 
 > RQ1 优先：先把 batch sweep（`nq` 轴）与 SIMD 对照跑成“强证据表”，再继续做更复杂的 codec/策略。

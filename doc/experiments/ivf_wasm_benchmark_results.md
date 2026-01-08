@@ -46,6 +46,16 @@ For F32 data which exceeds the cache or requires streaming:
 *   **F32:** Offloading distance calculation to the Host (`WASM Warm + Host Dist`) reduces latency slightly (9.45ms -> 7.65ms), primarily by leveraging Host's superior AVX/NEON implementation and bypassing some WASM memory management.
 *   **F16:** Offloading offers **no benefit** (sometimes slower due to call overhead) because WASM SIMD is already efficient enough, and the data is already resident in WASM memory.
 
+### 3.5. On-Demand IO Benefit (New Result)
+*   **Time-to-First-Query (TTFQ):** For a 100k vector index (25MB), the cold-start query latency dropped from **22.9ms** (Full Load) to **1.26ms** (On-Demand), an **18.1x speedup**.
+*   **Bandwidth Savings:** Only **0.98MB** (4%) of the index was fetched compared to the 25MB total size.
+*   **Implication:** This decoupling makes WASM artifacts viable for "serverless" or "on-demand" vector search where loading the whole index into memory is non-viable.
+
+### 3.6. Storage Anatomy: IVF vs HNSW
+*   **IVF-Flat:** Structural overhead is **< 1%**. Over 99% of storage is purely vector data.
+*   **HNSW:** Structural overhead is **~25%** due to its complex graph structure.
+*   **Observation:** F3's focus on IVF allows the maximum possible benefit from vector compression (PQ) and on-demand loading of contiguous posting lists.
+
 ## 4. Recommendations
 
 1.  **Adopt F16/Quantization:** Use `raw_f16` or quantized encodings for WASM indexes. This maximizes cache efficiency and minimizes the expensive Host-to-WASM data copy.
